@@ -1,0 +1,48 @@
+# Cloudflare Worker configuration for cowork-tunnel.
+#
+# Setup:
+#   1. npm install -g wrangler
+#   2. wrangler login
+#   3. Copy this file and worker.js to a directory
+#   4. wrangler secret put RELAY_TOKEN
+#   5. wrangler deploy
+#
+# Generate a token:
+#   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+
+name = "cowork-tunnel"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# Workers Logs. Without this there is no signal at all when a tunnel fails.
+[observability]
+enabled = true
+
+[vars]
+DEFAULT_PORT = "22"
+
+# --- Access control ---------------------------------------------------------
+#
+# RELAY_TOKEN is the only thing between the internet and an arbitrary-host TCP
+# proxy running on your Cloudflare account. Set it with
+#   wrangler secret put RELAY_TOKEN
+# never as a plain var here, which would commit it to the repo. Rotate it the
+# moment you think it has leaked.
+#
+# By default any target host and port is reachable. The two settings below can
+# narrow that if you want them; both are optional and off by default.
+#
+# ALLOWED_HOSTS: only these targets are reachable (exact, case-insensitive host
+# match). An entry here also exempts that host from BLOCK_PRIVATE, so
+# allowlisting an internal host does work.
+# ALLOWED_HOSTS = "server1.com,server2.com,192.168.1.5"
+#
+# BLOCK_PRIVATE: refuse targets that look private or loopback. This is a
+# lexical check on the target string and does not resolve DNS, so treat it as a
+# guardrail against typos rather than a security boundary.
+# BLOCK_PRIVATE = "1"
+
+# Custom domain (optional, requires DNS setup)
+# [[routes]]
+# pattern = "tunnel.yourdomain.com/*"
+# zone_name = "yourdomain.com"

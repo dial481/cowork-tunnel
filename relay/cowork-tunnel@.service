@@ -1,0 +1,71 @@
+# /etc/systemd/system/cowork-tunnel@.service
+#
+# Templated systemd unit. The instance name selects both the relay script and
+# its config, so one unit file runs both modes:
+#
+#   cowork-tunnel@universal   -> /opt/cowork-tunnel/universal.py
+#                                /etc/cowork-tunnel/universal.env
+#   cowork-tunnel@standalone  -> /opt/cowork-tunnel/standalone.py
+#                                /etc/cowork-tunnel/standalone.env
+#
+# Install (see README for the full walkthrough):
+#   sudo install -d -m 755 /opt/cowork-tunnel
+#   sudo install -m 644 relay/universal.py relay/standalone.py /opt/cowork-tunnel/
+#   sudo install -m 644 relay/cowork-tunnel@.service /etc/systemd/system/
+#
+# The service runs as User=nobody with ProtectHome=yes, so it cannot see
+# packages installed into a user's home directory. Give it its own venv:
+#   sudo python3 -m venv /opt/cowork-tunnel/venv
+#   sudo /opt/cowork-tunnel/venv/bin/pip install -q websockets
+#
+# Config (root-owned, 0600 -- systemd reads it as root before dropping to
+# User=, so the relay account never needs read access):
+#   sudo install -d -m 700 /etc/cowork-tunnel
+#   printf 'RELAY_TOKEN=%s\nWS_PORT=8765\n' "$TOKEN" \
+#     | sudo tee /etc/cowork-tunnel/universal.env >/dev/null
+#   sudo chmod 600 /etc/cowork-tunnel/universal.env
+#
+# Start:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cowork-tunnel@universal
+#   sudo systemctl enable --now cowork-tunnel@standalone
+#
+# Both relays must use different WS_PORT values; nginx routes a separate
+# location to each.
+
+[Unit]
+Description=Cowork SSH Tunnel Relay (%i)
+Documentation=https://github.com/dial481/cowork-tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+
+ExecStart=/opt/cowork-tunnel/venv/bin/python3 /opt/cowork-tunnel/%i.py
+EnvironmentFile=/etc/cowork-tunnel/%i.env
+
+Restart=always
+RestartSec=5
+
+# Security hardening. The relay needs outbound TCP and nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_UNIX and AF_NETLINK are required by glibc's resolver -- without them
+# getaddrinfo() fails and the universal relay cannot resolve hostname targets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

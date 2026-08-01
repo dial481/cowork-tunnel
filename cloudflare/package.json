@@ -1,0 +1,16 @@
+{
+  "name": "cowork-tunnel",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker: SSH over WebSocket tunnel",
+  "main": "worker.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "check": "node --check worker.js"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

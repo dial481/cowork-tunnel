@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Bootstrap script for new Cowork cloud sessions.
+# Downloads ws_proxy.py, installs deps, and configures SSH.
+#
+# Usage:
+#   # Set these before running:
+#   export COWORK_RELAY_URL="wss://your-relay.example.com/ssh"
+#   export COWORK_RELAY_TOKEN="your-secret-token"
+#
+#   # Then run:
+#   curl -fsSL https://raw.githubusercontent.com/dial481/cowork-tunnel/main/client/bootstrap.sh | bash
+#
+#   # Or for universal/cloudflare mode with a default target:
+#   export COWORK_RELAY_URL="wss://jump.example.com/ssh?target=192.168.1.1:22"
+#
+# Re-running is safe: the SSH config block is replaced, not appended again.
+
+set -euo pipefail
+
+REPO_RAW="https://raw.githubusercontent.com/dial481/cowork-tunnel/main"
+INSTALL_DIR="${COWORK_TUNNEL_DIR:-/tmp/cowork-tunnel}"
+SSH_CONFIG="${HOME}/.ssh/config"
+MARKER_BEGIN="# >>> cowork-tunnel begin >>>"
+MARKER_END="# <<< cowork-tunnel end <<<"
+
+echo "[cowork-tunnel] Setting up SSH tunnel..."
+
+# --- Validate config first, before changing anything on the machine ---------
+if [ -z "${COWORK_RELAY_URL:-}" ]; then
+    echo "[cowork-tunnel] ERROR: COWORK_RELAY_URL not set." >&2
+    echo "  export COWORK_RELAY_URL=\"wss://your-relay.example.com/ssh\"" >&2
+    exit 1
+fi
+
+if [ -z "${COWORK_RELAY_TOKEN:-}" ]; then
+    echo "[cowork-tunnel] WARNING: COWORK_RELAY_TOKEN not set. Auth will fail." >&2
+fi
+
+# --- Dependencies -----------------------------------------------------------
+if ! command -v ssh &>/dev/null; then
+    echo "[cowork-tunnel] Installing openssh-client..."
+    apt-get update -qq && apt-get install -y -qq openssh-client >/dev/null
+fi
+
+if ! python3 -c "import websockets" 2>/dev/null; then
+    echo "[cowork-tunnel] Installing websockets..."
+    pip install websockets -q --break-system-packages
+fi
+
+# --- Download the proxy -----------------------------------------------------
+# -f makes curl fail on 4xx/5xx. Without it a 404 page is written to disk as
+# ws_proxy.py and the failure only shows up later as a broken SSH session.
+mkdir -p "$INSTALL_DIR"
+TMP_PROXY="$(mktemp "${INSTALL_DIR}/.ws_proxy.XXXXXX.py")"
+trap 'rm -f "$TMP_PROXY"' EXIT
+
+if ! curl -fsSL "${REPO_RAW}/client/ws_proxy.py" -o "$TMP_PROXY"; then
+    echo "[cowork-tunnel] ERROR: failed to download ws_proxy.py from ${REPO_RAW}" >&2
+    exit 1
+fi
+
+if ! head -n 1 "$TMP_PROXY" | grep -q '^#!/usr/bin/env python3'; then
+    echo "[cowork-tunnel] ERROR: downloaded ws_proxy.py does not look like the expected script." >&2
+    echo "  First line: $(head -n 1 "$TMP_PROXY")" >&2
+    exit 1
+fi
+
+mv "$TMP_PROXY" "${INSTALL_DIR}/ws_proxy.py"
+trap - EXIT
+chmod +x "${INSTALL_DIR}/ws_proxy.py"
+
+# --- Configure SSH ----------------------------------------------------------
+# Replace any previous block rather than appending a second `Host *` stanza.
+mkdir -p "$(dirname "$SSH_CONFIG")"
+chmod 700 "$(dirname "$SSH_CONFIG")"
+touch "$SSH_CONFIG"
+
+if grep -qF "$MARKER_BEGIN" "$SSH_CONFIG"; then
+    echo "[cowork-tunnel] Updating existing SSH config block..."
+    sed -i "/${MARKER_BEGIN}/,/${MARKER_END}/d" "$SSH_CONFIG"
+fi
+
+cat >> "$SSH_CONFIG" << SSHEOF
+${MARKER_BEGIN}
+# SSH over WebSocket. Remove this block to disable the tunnel.
+Host *
+    ProxyCommand python3 ${INSTALL_DIR}/ws_proxy.py
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+${MARKER_END}
+SSHEOF
+
+chmod 600 "$SSH_CONFIG"
+
+echo "[cowork-tunnel] Ready. SSH will tunnel through ${COWORK_RELAY_URL}"
+echo "[cowork-tunnel] Note: the 'Host *' block routes ALL ssh through the tunnel."
+echo "[cowork-tunnel] Test with: ssh user@your-server"
