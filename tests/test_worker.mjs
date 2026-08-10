@@ -20,6 +20,8 @@
 
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import netModule from "node:net";
+import { createServer as createTcpServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -43,21 +45,93 @@ function check(name, ok, detail = "") {
 // ---------------------------------------------------------------------------
 // Load the Worker with cloudflare:sockets stubbed out
 // ---------------------------------------------------------------------------
+// connect() defers to a hook the tests install, so cloudflare:sockets can be
+// backed by a real TCP socket for the bridge tests.
 const SOCKET_STUB =
   "data:text/javascript," +
   encodeURIComponent(
-    "export function connect(){throw new Error('cloudflare:sockets is not " +
-      "exercised by these tests');}"
+    "export function connect(o){return globalThis.__ctConnect(o);}"
   );
 
 async function loadWorker() {
   const source = await readFile(path.join(REPO, "cloudflare", "worker.js"), "utf8");
-  const patched = source.replace(/from\s+["']cloudflare:sockets["']/, `from "${SOCKET_STUB}"`);
+  let patched = source.replace(/from\s+["']cloudflare:sockets["']/, `from "${SOCKET_STUB}"`);
   if (patched === source) {
     throw new Error("could not redirect the cloudflare:sockets import");
   }
+  // bridge() is module-scoped in the Worker. Exporting it here is what lets the
+  // SSH path be tested at all: driving it through fetch() would need a
+  // WebSocketPair and a 101 Response, neither of which Node can construct.
+  patched += "\nexport { bridge };\n";
   const url = "data:text/javascript;base64," + Buffer.from(patched).toString("base64");
-  return (await import(url)).default;
+  const mod = await import(url);
+  return { worker: mod.default, bridge: mod.bridge };
+}
+
+// --------------------------------------------------------------------------
+// Stand-ins for the two Workers APIs the bridge uses
+// --------------------------------------------------------------------------
+
+/** Minimal WebSocket end: records what the bridge sends and how it closed. */
+function fakeWebSocket() {
+  const listeners = {};
+  return {
+    sent: [],
+    closed: null,
+    accept() {},
+    addEventListener(type, fn) {
+      (listeners[type] ||= []).push(fn);
+    },
+    send(data) {
+      this.sent.push(Buffer.from(data));
+    },
+    close(code, reason) {
+      if (!this.closed) this.closed = { code, reason };
+    },
+    // test-side drivers
+    emit(type, event) {
+      for (const fn of listeners[type] || []) fn(event);
+    },
+    emitMessage(data) {
+      this.emit("message", { data });
+    },
+  };
+}
+
+/**
+ * cloudflare:sockets connect(), backed by node:net.
+ *
+ * `stall` never settles writes, which is how the buffer-limit path is reached
+ * without depending on kernel socket timing.
+ */
+function socketFactory({ stall = false } = {}) {
+  return ({ hostname, port }) => {
+    const net = netModule;
+    const sock = net.connect(port, hostname);
+    const opened = new Promise((resolve, reject) => {
+      sock.once("connect", resolve);
+      sock.once("error", reject);
+    });
+    opened.catch(() => {});
+    return {
+      opened,
+      readable: new ReadableStream({
+        start(controller) {
+          sock.on("data", (d) => controller.enqueue(new Uint8Array(d)));
+          sock.on("end", () => { try { controller.close(); } catch {} });
+          sock.on("error", () => { try { controller.close(); } catch {} });
+        },
+      }),
+      writable: {
+        getWriter: () => ({
+          write: (chunk) =>
+            stall ? new Promise(() => {}) : new Promise((res, rej) =>
+              sock.write(Buffer.from(chunk), (e) => (e ? rej(e) : res()))),
+        }),
+      },
+      close() { sock.destroy(); },
+    };
+  };
 }
 
 // Workers exposes crypto.subtle.timingSafeEqual; Node does not.
@@ -169,7 +243,7 @@ function decode(b64) {
 // ---------------------------------------------------------------------------
 async function main() {
   console.log("=== cowork-tunnel Worker test suite ===");
-  const worker = await loadWorker();
+  const { worker, bridge } = await loadWorker();
   const { server, port } = await startUpstream();
   const base = `http://127.0.0.1:${port}`;
 
@@ -396,6 +470,129 @@ async function main() {
       lines.some((l) => l.includes("401 auth failed")), JSON.stringify(lines));
     check("logs do not contain the full target URL",
       !lines.some((l) => l.includes("/json")), JSON.stringify(lines));
+    // ----------------------------------------------------------------------
+    // SSH bridge. Until now this had no coverage at all: it needs a real
+    // WebSocketPair and cloudflare:sockets, so it was reviewed by eye and
+    // exercised only against a deployed Worker.
+    // ----------------------------------------------------------------------
+    console.log("\nSSH bridge:");
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const until = async (fn, ms = 3000) => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(10); }
+      return false;
+    };
+
+    // A stand-in sshd: greets, then echoes.
+    const received = [];
+    const sshd = createTcpServer((sock) => {
+      sock.write("SSH-2.0-MockSSHD\r\n");
+      sock.on("data", (d) => { received.push(Buffer.from(d)); sock.write(d); });
+      sock.on("error", () => {});
+    });
+    await new Promise((r) => sshd.listen(0, "127.0.0.1", r));
+    const sshdPort = sshd.address().port;
+
+    globalThis.__ctConnect = socketFactory();
+    {
+      const ws = fakeWebSocket();
+      bridge(ws, "127.0.0.1", sshdPort);
+      const gotBanner = await until(() =>
+        Buffer.concat(ws.sent).toString().includes("SSH-2.0-MockSSHD"));
+      check("bridge relays the target's banner to the client", gotBanner,
+        Buffer.concat(ws.sent).toString().slice(0, 40));
+
+      ws.emitMessage(new TextEncoder().encode("hello-from-client").buffer);
+      const gotData = await until(() =>
+        Buffer.concat(received).toString().includes("hello-from-client"));
+      check("bridge forwards client bytes to the target", gotData,
+        Buffer.concat(received).toString().slice(0, 40));
+      check("bridge stays open during normal traffic", ws.closed === null,
+        JSON.stringify(ws.closed));
+    }
+
+    // Frames queued before the socket finishes opening must not be lost: an
+    // SSH client sends its version string immediately, without waiting.
+    {
+      const ws = fakeWebSocket();
+      bridge(ws, "127.0.0.1", sshdPort);
+      ws.emitMessage(new TextEncoder().encode("first-").buffer);
+      ws.emitMessage(new TextEncoder().encode("second").buffer);
+      const ordered = await until(() =>
+        Buffer.concat(received).toString().includes("first-second"));
+      check("frames sent before the socket opens are queued and kept in order",
+        ordered, Buffer.concat(received).toString().slice(-40));
+    }
+
+    // A text frame would inject corrupt bytes into a byte stream.
+    {
+      const ws = fakeWebSocket();
+      bridge(ws, "127.0.0.1", sshdPort);
+      await until(() => ws.sent.length > 0);
+      ws.emitMessage("i am a string");
+      check("a text frame closes the tunnel with 1003",
+        await until(() => ws.closed?.code === 1003), JSON.stringify(ws.closed));
+    }
+
+    // The target going away must be reported, not left hanging.
+    {
+      const ws = fakeWebSocket();
+      const closer = createTcpServer((sock) => { sock.write("bye"); sock.end(); });
+      await new Promise((r) => closer.listen(0, "127.0.0.1", r));
+      bridge(ws, "127.0.0.1", closer.address().port);
+      check("the target closing closes the tunnel with 1000",
+        await until(() => ws.closed?.code === 1000), JSON.stringify(ws.closed));
+      closer.close();
+    }
+
+    // A refused connection must surface as 1011, not as a silent normal close
+    // that looks like the user hung up.
+    {
+      const ws = fakeWebSocket();
+      const dead = createTcpServer(() => {});
+      await new Promise((r) => dead.listen(0, "127.0.0.1", r));
+      const deadPort = dead.address().port;
+      await new Promise((r) => dead.close(r));
+      bridge(ws, "127.0.0.1", deadPort);
+      check("an unreachable target closes the tunnel with 1011",
+        await until(() => ws.closed?.code === 1011), JSON.stringify(ws.closed));
+      check("the 1011 reason names the target",
+        String(ws.closed?.reason || "").includes(String(deadPort)),
+        String(ws.closed?.reason));
+    }
+
+    // A peer that never drains must not grow the isolate until it is killed.
+    {
+      globalThis.__ctConnect = socketFactory({ stall: true });
+      const ws = fakeWebSocket();
+      bridge(ws, "127.0.0.1", sshdPort);
+      await sleep(100);
+      const chunk = new Uint8Array(1024 * 1024);
+      for (let i = 0; i < 9 && ws.closed === null; i++) ws.emitMessage(chunk.buffer);
+      check("a stuck target trips the buffer limit and closes with 1009",
+        await until(() => ws.closed?.code === 1009), JSON.stringify(ws.closed));
+      globalThis.__ctConnect = socketFactory();
+    }
+
+    // close() must tear down the TCP side, not just the WebSocket.
+    {
+      const ws = fakeWebSocket();
+      let destroyed = false;
+      const watched = createTcpServer((sock) => {
+        sock.write("hi");
+        sock.on("close", () => { destroyed = true; });
+      });
+      await new Promise((r) => watched.listen(0, "127.0.0.1", r));
+      bridge(ws, "127.0.0.1", watched.address().port);
+      await until(() => ws.sent.length > 0);
+      ws.emit("close", {});
+      check("a client disconnect tears down the target socket",
+        await until(() => destroyed), `destroyed=${destroyed}`);
+      watched.close();
+    }
+
+    sshd.close();
   } finally {
     server.close();
   }
@@ -409,6 +606,11 @@ async function main() {
     process.exit(1);
   }
   console.log(`\n${passed}/${total} checks passed -- ALL PASS`);
+  // The bridge tests leave TCP sockets open on purpose (a stalled writer, a
+  // half-closed peer), so the event loop would never drain on its own and the
+  // run would hang after reporting success. The failure path already exits
+  // explicitly; this makes the success path symmetrical.
+  process.exit(0);
 }
 
 main().catch((e) => {

@@ -102,8 +102,11 @@ The script takes three optional overrides:
 | Variable | Default | Meaning |
 |---|---|---|
 | `COWORK_TUNNEL_DIR` | `/tmp/cowork-tunnel` | Where the client scripts are installed |
+| `COWORK_TUNNEL_PYTHON` | *(unset)* | An interpreter you manage — a venv, a conda env, anything. Set it and bootstrap installs nothing and creates nothing |
 | `COWORK_TUNNEL_REF` | `main` | Branch, tag or commit to fetch the clients from |
 | `COWORK_TUNNEL_REPO_RAW` | GitHub raw URL | A different origin entirely, for a fork or a mirror |
+
+`ws_proxy.py` needs the `websockets` package; `http_proxy.py` needs nothing beyond the standard library. If your `python3` already has `websockets`, bootstrap uses it as-is. If it does not, bootstrap builds a venv under `COWORK_TUNNEL_DIR` rather than installing into system Python — distro Pythons are marked externally-managed (PEP 668) and `pip --break-system-packages` exists to override that guard, which is not a thing an installer should do to you by default. Set `COWORK_TUNNEL_PYTHON` to opt out entirely and manage the environment yourself. Failing to install `websockets` is a warning, not an error: the HTTP proxy still installs and works.
 
 Keep the clients and the relay on the same revision. Installing a client from `main` while running a relay from a branch is how you get behaviour that matches neither.
 
@@ -483,7 +486,9 @@ node tests/test_worker.mjs       # Cloudflare Worker; needs Node 18+
 
 The suite imports the relay scripts for unit tests and spawns them as real subprocesses for integration tests, so it covers the code that actually ships. It runs fully offline — every target is a loopback address or an IP literal. CI runs it on Python 3.10–3.12, plus `shellcheck` on the bootstrap script and a syntax check on the Worker.
 
-The Worker is tested too, despite having no local runtime. `tests/test_worker.mjs` loads the real `cloudflare/worker.js` with its one `cloudflare:sockets` import redirected to a stub, then calls the exported `fetch` handler directly — Node supplies the rest of what the proxy path uses (`fetch`, `Request`, `Response`, `Headers`, `atob`/`btoa`) from the same web-standard implementations Workers exposes. That covers routing, auth, forwarding, response fidelity and malformed input. The SSH bridge still needs real TCP sockets and a real `WebSocketPair`, so it remains reviewed by hand.
+The Worker is tested too, despite having no local runtime. `tests/test_worker.mjs` loads the real `cloudflare/worker.js` with its one `cloudflare:sockets` import redirected to a stub, then calls the exported `fetch` handler directly — Node supplies the rest of what the proxy path uses (`fetch`, `Request`, `Response`, `Headers`, `atob`/`btoa`) from the same web-standard implementations Workers exposes. That covers routing, auth, forwarding, response fidelity and malformed input.
+
+The SSH bridge is covered too. `bridge()` is module-scoped, and driving it through `fetch()` would need a `WebSocketPair` and a 101 `Response`, neither of which Node can construct — so the harness exports it from the in-memory copy and calls it directly, with `cloudflare:sockets` backed by `node:net`. `cloudflare/worker.js` on disk is never modified; `git diff` proves it. What that leaves untested is the wiring between `fetch()` and `bridge()` on the real runtime, which is exercised against a deployed Worker instead.
 
 `websockets>=14.1` is the declared floor and CI pins that exact version in a separate job. Installing only the newest release would never prove the floor still works — and it did not: 14.0 and earlier lack `ClientConnection.close_code`, which `ws_proxy.py` needs to tell you *why* a tunnel was refused.
 

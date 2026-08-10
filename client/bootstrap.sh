@@ -49,9 +49,57 @@ if ! command -v ssh &>/dev/null; then
     apt-get update -qq && apt-get install -y -qq openssh-client >/dev/null
 fi
 
-if ! python3 -c "import websockets" 2>/dev/null; then
-    echo "[cowork-tunnel] Installing websockets..."
-    pip install websockets -q --break-system-packages
+# ws_proxy.py needs the websockets package; http_proxy.py needs nothing beyond
+# the standard library. TUNNEL_PYTHON is whichever interpreter can import it,
+# and the SSH ProxyCommand below is written to use exactly that one.
+# Set COWORK_TUNNEL_PYTHON to an interpreter you manage -- a venv, a conda env,
+# anything -- and bootstrap installs nothing and creates nothing. Otherwise it
+# uses the system python3 if that already has websockets, and only falls back
+# to building a venv when the package is genuinely missing.
+TUNNEL_PYTHON="${COWORK_TUNNEL_PYTHON:-python3}"
+if [ -n "${COWORK_TUNNEL_PYTHON:-}" ]; then
+    # ssh runs ProxyCommand from an arbitrary working directory, so a relative
+    # path would resolve differently there than it does here. Fail now rather
+    # than writing a Host * block that breaks every SSH connection on the box.
+    if ! command -v "$TUNNEL_PYTHON" >/dev/null 2>&1; then
+        echo "[cowork-tunnel] ERROR: COWORK_TUNNEL_PYTHON is not executable: ${TUNNEL_PYTHON}" >&2
+        exit 1
+    fi
+    TUNNEL_PYTHON="$(command -v "$TUNNEL_PYTHON")"
+    case "$TUNNEL_PYTHON" in
+        /*) ;;
+        *)  TUNNEL_PYTHON="$(cd "$(dirname "$TUNNEL_PYTHON")" && pwd)/$(basename "$TUNNEL_PYTHON")" ;;
+    esac
+fi
+if ! "$TUNNEL_PYTHON" -c "import websockets" 2>/dev/null; then
+    if [ -n "${COWORK_TUNNEL_PYTHON:-}" ]; then
+        # Their interpreter, their call. Say what is wrong and change nothing.
+        echo "[cowork-tunnel] WARNING: ${COWORK_TUNNEL_PYTHON} cannot import websockets." >&2
+        echo "  The SSH tunnel needs it: ${COWORK_TUNNEL_PYTHON} -m pip install websockets" >&2
+        echo "  The HTTP proxy does not, and still works." >&2
+    else
+        echo "[cowork-tunnel] Installing websockets (needed for the SSH tunnel)..."
+        mkdir -p "$INSTALL_DIR"
+        # A private venv first. `python3 -m venv` bootstraps its own pip through
+        # ensurepip, so this works on hosts that ship no pip at all, needs no
+        # --break-system-packages, and leaves system packages untouched. The
+        # fallbacks matter where python3-venv is missing but pip is present; note
+        # that pip older than 23 rejects --break-system-packages.
+        if python3 -m venv "${INSTALL_DIR}/venv" >/dev/null 2>&1 &&
+           "${INSTALL_DIR}/venv/bin/python3" -m pip install -q websockets >/dev/null 2>&1; then
+            TUNNEL_PYTHON="${INSTALL_DIR}/venv/bin/python3"
+            echo "[cowork-tunnel] Installed into ${INSTALL_DIR}/venv"
+        elif python3 -m pip install -q --break-system-packages websockets 2>/dev/null; then
+            :
+        elif python3 -m pip install -q websockets 2>/dev/null; then
+            :
+        else
+            # Not fatal: the HTTP proxy is standard-library only and still installs.
+            echo "[cowork-tunnel] WARNING: could not install websockets." >&2
+            echo "  The SSH tunnel needs it. The HTTP proxy does not, and still works." >&2
+            echo "  Install python3-venv, or run: python3 -m pip install websockets" >&2
+        fi
+    fi
 fi
 
 # --- Download the proxy scripts ---------------------------------------------
@@ -65,6 +113,10 @@ mkdir -p "$INSTALL_DIR"
 TMP_DOWNLOAD=""
 cleanup() {
     [ -n "$TMP_DOWNLOAD" ] && rm -f "$TMP_DOWNLOAD"
+    # An EXIT trap's last command becomes the script's exit status, so without
+    # this a successful run exits 1 the moment TMP_DOWNLOAD is empty -- which
+    # it always is once the download has been moved into place.
+    return 0
 }
 trap cleanup EXIT INT TERM
 
@@ -111,7 +163,7 @@ cat >> "$SSH_CONFIG" << SSHEOF
 ${MARKER_BEGIN}
 # SSH over WebSocket. Remove this block to disable the tunnel.
 Host *
-    ProxyCommand python3 ${INSTALL_DIR}/ws_proxy.py
+    ProxyCommand ${TUNNEL_PYTHON} ${INSTALL_DIR}/ws_proxy.py
     ServerAliveInterval 60
     ServerAliveCountMax 3
 ${MARKER_END}

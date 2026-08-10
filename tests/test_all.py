@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib.util
+import inspect
 import json
 import os
 import shutil
 import ssl
+import subprocess
 import sys
 import tempfile
 import types
@@ -1545,6 +1547,245 @@ def test_http_proxy_client_useragent() -> None:
           f"got {env_ua(envelopes[2]) if len(envelopes) > 2 else None!r}")
 
 
+def _python_without_websockets(tmp: str) -> str:
+    """Return a python3 that cannot import websockets, on any host.
+
+    The venv branch of bootstrap.sh only runs when the interpreter lacks the
+    package. Relying on the host's python3 for that makes the test pass or fail
+    depending on whose machine it runs on. A fresh venv without
+    --system-site-packages cannot see site-packages, so it is deterministic
+    even where websockets is installed system-wide.
+    """
+    clean = os.path.join(tmp, "clean")
+    subprocess.run([sys.executable, "-m", "venv", clean], check=True,
+                   capture_output=True, timeout=120)
+    return os.path.join(clean, "bin", "python3")
+
+
+def _stub_wheel(outdir: str, name: str = "websockets", version: str = "99.0") -> None:
+    """Write a minimal, valid wheel so pip can install offline.
+
+    Lets the venv-building branch of bootstrap.sh be tested without a package
+    index: pip reads PIP_NO_INDEX and PIP_FIND_LINKS from the environment, so
+    the real code path runs unmodified against a local file.
+    """
+    import base64
+    import hashlib
+    import zipfile
+
+    os.makedirs(outdir, exist_ok=True)
+    dist = f"{name}-{version}.dist-info"
+    files = {
+        f"{name}/__init__.py": f'__version__ = "{version}"\n',
+        f"{dist}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        f"{dist}/WHEEL": ("Wheel-Version: 1.0\nGenerator: test\n"
+                          "Root-Is-Purelib: true\nTag: py3-none-any\n"),
+    }
+    record = []
+    with zipfile.ZipFile(os.path.join(outdir, f"{name}-{version}-py3-none-any.whl"), "w") as z:
+        for path, content in files.items():
+            z.writestr(path, content)
+            digest = base64.urlsafe_b64encode(
+                hashlib.sha256(content.encode()).digest()).rstrip(b"=").decode()
+            record.append(f"{path},sha256={digest},{len(content)}")
+        record.append(f"{dist}/RECORD,,")
+        z.writestr(f"{dist}/RECORD", "\n".join(record) + "\n")
+
+
+def test_bootstrap() -> None:
+    """Exercise bootstrap.sh offline, against a local copy of the repo.
+
+    The installer had no automated coverage until now, because it fetches from
+    GitHub and this suite runs offline. Two bugs reached a tagged release
+    through that gap: a successful run exited 1, and an unusable
+    COWORK_TUNNEL_PYTHON was written into the SSH config regardless. Both are
+    asserted below.
+
+    COWORK_TUNNEL_REPO_RAW points at a local server, and PATH supplies a
+    python3 that already imports websockets, so nothing is downloaded from the
+    internet and no package is installed. The venv-building branch needs a real
+    package index and is therefore verified by hand, not here.
+    """
+    print("\nBootstrap installer (client/bootstrap.sh):")
+
+    script = os.path.join(REPO, "client", "bootstrap.sh")
+    handler_mode = {"mode": "ok"}
+
+    class _Serve(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # noqa: ANN001
+            pass
+
+        def do_GET(self):
+            name = os.path.basename(self.path)
+            if handler_mode["mode"] == "404":
+                self.send_error(404)
+                return
+            if handler_mode["mode"] == "corrupt":
+                body = b"<html>not a python script</html>"
+            else:
+                with open(os.path.join(CLIENT_DIR, name), "rb") as fh:
+                    body = fh.read()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    port = alloc_port()
+    server = HTTPServer(("127.0.0.1", port), _Serve)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def run(tmp: str, extra: dict[str, str] | None = None,
+            interpreter: str | None = None) -> subprocess.CompletedProcess:
+        # A python3 on PATH that can import websockets, so bootstrap takes the
+        # "already installed" branch and never reaches for the network.
+        shim = os.path.join(tmp, "bin")
+        os.makedirs(shim, exist_ok=True)
+        link = os.path.join(shim, "python3")
+        if not os.path.exists(link):
+            # A wrapper, not a symlink: a venv interpreter locates pyvenv.cfg
+            # relative to the path it was invoked through, so a symlink parked
+            # in a temp directory silently demotes it to the system Python.
+            with open(link, "w") as fh:
+                fh.write(f'#!/bin/sh\nexec "{interpreter or sys.executable}" "$@"\n')
+            os.chmod(link, 0o755)
+        env = {
+            **os.environ,
+            "HOME": tmp,
+            "PATH": shim + os.pathsep + os.environ["PATH"],
+            "COWORK_TUNNEL_DIR": os.path.join(tmp, "ct"),
+            "COWORK_TUNNEL_REPO_RAW": f"http://127.0.0.1:{port}",
+            "COWORK_RELAY_URL": "wss://relay.example.com/ssh",
+            "COWORK_RELAY_TOKEN": "test-token",
+        }
+        env.update(extra or {})
+        return subprocess.run(["bash", script], env=env, capture_output=True,
+                              text=True, timeout=120)
+
+    def proxy_command(tmp: str) -> str:
+        cfg = os.path.join(tmp, ".ssh", "config")
+        if not os.path.exists(cfg):
+            return ""
+        for line in open(cfg):
+            if "ProxyCommand" in line:
+                return line.split("ProxyCommand", 1)[1].strip()
+        return ""
+
+    try:
+        # Happy path. The exit status is the point: an EXIT trap whose last
+        # command is falsy silently turns success into failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run(tmp)
+            check("bootstrap exits 0 on success", r.returncode == 0,
+                  f"rc={r.returncode} err={r.stderr[-160:]}")
+            ct = os.path.join(tmp, "ct")
+            for name in ("ws_proxy.py", "http_proxy.py"):
+                path = os.path.join(ct, name)
+                check(f"bootstrap installs {name}", os.path.exists(path))
+                check(f"{name} is executable",
+                      os.path.exists(path) and os.access(path, os.X_OK))
+            cmd = proxy_command(tmp)
+            check("ProxyCommand names an absolute ws_proxy.py",
+                  "/ws_proxy.py" in cmd and cmd.split()[-1].startswith("/"), cmd)
+            check("no venv built when the interpreter already has websockets",
+                  not os.path.isdir(os.path.join(ct, "venv")))
+
+            r = run(tmp)
+            check("re-running exits 0", r.returncode == 0, f"rc={r.returncode}")
+            cfg = open(os.path.join(tmp, ".ssh", "config")).read()
+            check("re-running leaves exactly one Host * block",
+                  cfg.count("cowork-tunnel begin") == 1,
+                  f"blocks={cfg.count('cowork-tunnel begin')}")
+
+        # A caller-supplied interpreter is used as-is and never installed into.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run(tmp, {"COWORK_TUNNEL_PYTHON": sys.executable})
+            check("supplied interpreter is honoured", r.returncode == 0
+                  and proxy_command(tmp).startswith(sys.executable), proxy_command(tmp))
+            check("supplied interpreter suppresses the venv",
+                  not os.path.isdir(os.path.join(tmp, "ct", "venv")))
+
+        # ssh runs ProxyCommand from an arbitrary directory, so a relative path
+        # has to be resolved before it is written.
+        with tempfile.TemporaryDirectory() as tmp:
+            rel = os.path.relpath(sys.executable, os.getcwd())
+            r = run(tmp, {"COWORK_TUNNEL_PYTHON": rel})
+            check("a relative interpreter is resolved to an absolute path",
+                  r.returncode == 0 and proxy_command(tmp).startswith("/"),
+                  proxy_command(tmp))
+
+        # An unusable interpreter must stop the run rather than write a Host *
+        # block that breaks every SSH connection on the machine.
+        with tempfile.TemporaryDirectory() as tmp:
+            r = run(tmp, {"COWORK_TUNNEL_PYTHON": "/nonexistent/python3"})
+            check("an unusable interpreter is fatal", r.returncode != 0,
+                  f"rc={r.returncode}")
+            check("nothing is written to the SSH config when it fails",
+                  proxy_command(tmp) == "", proxy_command(tmp))
+
+        # The venv branch, which is what runs on a host whose python3 lacks
+        # websockets. No shim here: the system interpreter genuinely cannot
+        # import it, so bootstrap must build a venv. pip is pointed at a local
+        # wheel, so this stays offline while exercising the real code path.
+        with tempfile.TemporaryDirectory() as tmp:
+            wheels = os.path.join(tmp, "wheels")
+            _stub_wheel(wheels)
+            r = run(tmp, {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": wheels},
+                    interpreter=_python_without_websockets(tmp))
+            venv = os.path.join(tmp, "ct", "venv")
+            built = os.path.isdir(venv)
+            check("bootstrap builds a venv when websockets is missing", built,
+                  f"rc={r.returncode} err={r.stderr[-200:]}")
+            check("the venv branch exits 0", r.returncode == 0, f"rc={r.returncode}")
+            check("ProxyCommand points into the venv it built",
+                  proxy_command(tmp).startswith(os.path.join(venv, "bin")),
+                  proxy_command(tmp))
+            # Guarded: running a binary that was never created raises
+            # FileNotFoundError, which would abort the whole suite rather than
+            # failing one check.
+            if built:
+                got = subprocess.run([os.path.join(venv, "bin", "python3"),
+                                      "-c", "import websockets; print('ok')"],
+                                     capture_output=True, text=True)
+                ok, detail = got.stdout.strip() == "ok", got.stderr[-120:]
+            else:
+                ok, detail = False, "no venv was built"
+            check("the venv it built can import websockets", ok, detail)
+
+        # Same branch, but nothing installable. The SSH half cannot work, yet
+        # http_proxy.py needs no third-party package, so the run must degrade
+        # rather than abort.
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "empty")
+            os.makedirs(empty, exist_ok=True)
+            r = run(tmp, {"PIP_NO_INDEX": "1", "PIP_FIND_LINKS": empty},
+                    interpreter=_python_without_websockets(tmp))
+            check("an uninstallable dependency is not fatal", r.returncode == 0,
+                  f"rc={r.returncode}")
+            check("it says what is wrong", "could not install websockets" in r.stderr.lower(),
+                  r.stderr[-160:])
+            check("the HTTP proxy is installed anyway",
+                  os.path.exists(os.path.join(tmp, "ct", "http_proxy.py")))
+
+        # A download that 404s must not be installed as if it were a script.
+        with tempfile.TemporaryDirectory() as tmp:
+            handler_mode["mode"] = "404"
+            r = run(tmp)
+            check("a failed download is fatal", r.returncode != 0, f"rc={r.returncode}")
+            check("a failed download installs nothing",
+                  not os.path.exists(os.path.join(tmp, "ct", "ws_proxy.py")))
+
+        # An error page served with 200 must be rejected on its shebang.
+        with tempfile.TemporaryDirectory() as tmp:
+            handler_mode["mode"] = "corrupt"
+            r = run(tmp)
+            check("a non-script payload is refused", r.returncode != 0, f"rc={r.returncode}")
+            check("a non-script payload is not installed",
+                  not os.path.exists(os.path.join(tmp, "ct", "ws_proxy.py")))
+    finally:
+        handler_mode["mode"] = "ok"
+        server.shutdown()
+
+
 async def test_http_proxy_client_integration(sshd_port: int) -> None:
     """Integration test: use http_proxy.py as a subprocess through the relay."""
     print("\nHTTP proxy client integration (client/http_proxy.py):")
@@ -1590,36 +1831,54 @@ async def test_http_proxy_client_integration(sshd_port: int) -> None:
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+async def _guard(fn, *args) -> None:
+    """Run one test function, converting a crash into a single failed check.
+
+    Without this, an unexpected exception aborts the whole run: a
+    FileNotFoundError in one test once took roughly a hundred later checks with
+    it, and the summary line never printed, so the run looked truncated rather
+    than failed.
+    """
+    try:
+        result = fn(*args)
+        if inspect.isawaitable(result):
+            await result
+    except Exception as e:  # noqa: BLE001 - one broken test must not hide the rest
+        check(f"{fn.__name__} ran without raising", False,
+              f"{type(e).__name__}: {e}")
+
+
 async def run() -> bool:
     print("=== cowork-tunnel test suite ===")
 
-    test_target_parsing()
-    test_private_detection()
-    test_token_comparison()
-    test_allowlist_matching()
-    test_env_parsing()
+    await _guard(test_target_parsing)
+    await _guard(test_private_detection)
+    await _guard(test_token_comparison)
+    await _guard(test_allowlist_matching)
+    await _guard(test_env_parsing)
 
     sshd_port, hangup_port = alloc_port(), alloc_port()
     echo_srv = await asyncio.start_server(sshd_echo, "127.0.0.1", sshd_port)
     hang_srv = await asyncio.start_server(sshd_hangup, "127.0.0.1", hangup_port)
 
     try:
-        await test_standalone(sshd_port, hangup_port)
-        await test_limits(sshd_port)
-        await test_universal(sshd_port)
-        await test_ws_proxy_client(sshd_port)
+        await _guard(test_standalone, sshd_port, hangup_port)
+        await _guard(test_limits, sshd_port)
+        await _guard(test_universal, sshd_port)
+        await _guard(test_ws_proxy_client, sshd_port)
 
         # HTTP proxy tests
-        test_http_proxy_url_normalization()
-        test_http_proxy_header_stripping()
-        test_http_proxy_client_unit()
-        test_http_proxy_client_useragent()
-        await test_http_proxy(sshd_port)
-        await test_http_proxy_hardening(sshd_port)
-        await test_no_permessage_deflate(sshd_port)
-        await test_upstream_tls_verification()
-        await test_http_proxy_fidelity(sshd_port)
-        await test_http_proxy_client_integration(sshd_port)
+        await _guard(test_http_proxy_url_normalization)
+        await _guard(test_http_proxy_header_stripping)
+        await _guard(test_http_proxy_client_unit)
+        await _guard(test_http_proxy_client_useragent)
+        await _guard(test_bootstrap)
+        await _guard(test_http_proxy, sshd_port)
+        await _guard(test_http_proxy_hardening, sshd_port)
+        await _guard(test_no_permessage_deflate, sshd_port)
+        await _guard(test_upstream_tls_verification)
+        await _guard(test_http_proxy_fidelity, sshd_port)
+        await _guard(test_http_proxy_client_integration, sshd_port)
     finally:
         echo_srv.close()
         hang_srv.close()
