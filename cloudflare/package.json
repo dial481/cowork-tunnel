@@ -1,6 +1,6 @@
 {
   "name": "cowork-tunnel",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Cloudflare Worker: SSH over WebSocket tunnel",
   "main": "worker.js",
   "type": "module",

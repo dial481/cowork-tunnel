@@ -28,6 +28,32 @@ jobs:
       - name: Run test suite
         run: python3 tests/test_all.py
 
+  # bootstrap.sh branches on whether python3 can already import websockets. The
+  # job above installs it into the interpreter it then runs the suite with, so
+  # it only ever exercises the "already present" side. This job covers the
+  # other one: the suite runs from a venv while the python3 on PATH has no
+  # websockets, which is what a fresh host looks like and what drives
+  # bootstrap into building its own venv.
+  bootstrap-without-websockets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Confirm the python3 on PATH cannot import websockets
+        run: |
+          if python3 -c "import websockets" 2>/dev/null; then
+            echo "PATH python3 already has websockets; this job would duplicate the one above" >&2
+            exit 1
+          fi
+          echo "confirmed: python3 on PATH has no websockets"
+      - name: Run the suite from a venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt
+          .venv/bin/python tests/test_all.py
+
   # requirements.txt declares a floor; installing only the newest release would
   # never prove the floor still works. This job pins it explicitly.
   websockets-floor:
