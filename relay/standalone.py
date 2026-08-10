@@ -60,13 +60,29 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+def _env_int(name: str, default: int) -> int:
+    """Read a positive integer from the environment, falling back on garbage.
+
+    A typo in a systemd env file should not take the relay down with an
+    unhandled ValueError before it logs anything useful.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
 SSH_HOST = os.environ.get("SSH_HOST", "127.0.0.1")
-SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
+SSH_PORT = _env_int("SSH_PORT", 22)
 WS_HOST = os.environ.get("WS_HOST", "127.0.0.1")
-WS_PORT = int(os.environ.get("WS_PORT", "8765"))
-MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "10"))
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "20"))
+WS_PORT = _env_int("WS_PORT", 8765)
+MAX_CONNECTIONS = _env_int("MAX_CONNECTIONS", 10)
+RATE_LIMIT = _env_int("RATE_LIMIT", 20)
 
 CONNECT_TIMEOUT = 10
 BUF_SIZE = 65536
@@ -256,7 +272,13 @@ async def main():
         MAX_CONNECTIONS,
     )
 
-    async with serve(bridge, WS_HOST, WS_PORT, ping_interval=30, ping_timeout=120, max_size=None):
+    # compression=None: serve() negotiates permessage-deflate by default, and
+    # this carries an encrypted SSH stream that cannot compress. Leaving it on
+    # costs roughly 17x throughput for no benefit.
+    async with serve(
+        bridge, WS_HOST, WS_PORT,
+        ping_interval=30, ping_timeout=120, max_size=None, compression=None,
+    ):
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):

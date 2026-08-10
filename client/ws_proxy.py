@@ -228,6 +228,11 @@ async def proxy() -> None:
             ping_timeout=120,
             max_size=None,
             close_timeout=5,
+            # Do not even offer permessage-deflate. SSH is encrypted and does
+            # not compress, so deflate costs CPU on both ends to produce
+            # slightly larger frames. Declining here also covers relays we do
+            # not control, including the Cloudflare Worker path.
+            compression=None,
         ) as ws:
             socket = ws
             await _run_tunnel(ws)

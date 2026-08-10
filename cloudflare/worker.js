@@ -1,14 +1,17 @@
 /**
- * Cowork SSH Tunnel - Cloudflare Worker
+ * Cowork Tunnel - Cloudflare Worker
  *
- * Bridges WebSocket connections to TCP (SSH) endpoints.
- * Zero server installation required. Deploy once, reach any server.
+ * Two modes on one deployment:
+ *   1. WebSocket upgrade -> SSH tunneling (existing)
+ *   2. POST /proxy       -> HTTP request forwarding (new)
  *
  * Architecture:
- *   Cowork sandbox -> WSS/443 -> CF Edge -> Worker -> TCP:22 -> Any server
+ *   SSH:  Cowork sandbox -> WSS/443 -> CF Edge -> Worker -> TCP:22 -> Any server
+ *   HTTP: Cowork sandbox -> POST /proxy -> CF Edge -> Worker -> fetch() -> Any URL
  *
  * Usage:
- *   wss://tunnel.you.workers.dev/?target=192.168.1.1:22&token=xxx
+ *   SSH:  wss://tunnel.you.workers.dev/?target=192.168.1.1:22&token=xxx
+ *   HTTP: POST https://tunnel.you.workers.dev/proxy (with JSON envelope)
  *
  * By default this worker will connect to ANY target host and port. The bearer
  * token is the access control. Treat it like an SSH private key: anyone who
@@ -22,6 +25,10 @@
  *   BLOCK_PRIVATE  - Optional. "1"/"true" refuses targets that look private.
  *                    Default off. ALLOWED_HOSTS entries override it.
  *   DEFAULT_PORT   - Optional. Default port if not in target (default: 22).
+ *   MAX_RESPONSE_BODY - Optional. Largest upstream response the HTTP proxy will
+ *                    return, in bytes (default: 33554432, i.e. 32 MiB). Beyond
+ *                    this the caller gets a 502 rather than the isolate dying
+ *                    of memory exhaustion mid-encode.
  */
 
 import { connect } from "cloudflare:sockets";
@@ -31,6 +38,41 @@ const MAX_CLOSE_REASON = 100;
 // Cap on bytes queued toward the target before we give up, so a slow or stuck
 // peer cannot grow the isolate's memory until it is killed with no diagnostic.
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+// Maximum request body for POST /proxy (8 MiB).
+const MAX_PROXY_BODY = 8 * 1024 * 1024;
+
+// Maximum upstream response body, matching the Python relay's default.
+//
+// The response exists three times over during encoding -- the ArrayBuffer, the
+// binary string, and the base64 output -- so an uncapped forward of a large
+// download (a release asset, a git pack, a bulk API response) walks the isolate
+// into its 128 MB memory limit and dies with no diagnostic the caller can see.
+// A refusal the caller can read is strictly better than a silent crash.
+// Override with a MAX_RESPONSE_BODY var in wrangler.toml.
+const DEFAULT_MAX_RESPONSE_BODY = 32 * 1024 * 1024;
+
+function maxResponseBody(env) {
+  const raw = parseInt(env.MAX_RESPONSE_BODY || "", 10);
+  return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_MAX_RESPONSE_BODY;
+}
+
+// Schemes the HTTP proxy will forward.
+const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
+
+// RFC 9110 token, used to validate method names.
+const HTTP_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+// Hop-by-hop headers that must not be forwarded.
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
 export default {
   async fetch(request, env) {
@@ -39,12 +81,24 @@ export default {
     // Health check
     if (url.pathname === "/health") {
       return new Response(
-        JSON.stringify({ status: "ok", mode: "cloudflare-worker" }),
+        JSON.stringify({
+          status: "ok",
+          mode: "cloudflare-worker",
+          capabilities: ["ssh", "proxy"],
+        }),
         { headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Require WebSocket upgrade
+    // POST /proxy -- HTTP request forwarding
+    if (url.pathname === "/proxy") {
+      if (request.method !== "POST") {
+        return jsonError(405, "Method not allowed");
+      }
+      return handleProxy(request, url, env);
+    }
+
+    // Require WebSocket upgrade for all other paths
     const upgrade = request.headers.get("Upgrade");
     if (!upgrade || upgrade.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
@@ -107,6 +161,225 @@ export default {
     return new Response(null, { status: 101, webSocket: client });
   },
 };
+
+// ---------------------------------------------------------------------------
+// HTTP Proxy
+// ---------------------------------------------------------------------------
+
+function jsonError(status, message) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * Log one proxied request, mirroring the Python relay's format.
+ *
+ * Host only, never the full URL: a forwarded URL can carry tokens in its query
+ * string, and Workers logs are not the place for them.
+ */
+function logProxy(method, host, outcome) {
+  console.log(`[proxy] ${method} ${host} -> ${outcome}`);
+}
+
+/**
+ * Flatten response headers, keeping Set-Cookie out of the flat object.
+ *
+ * headers.entries() folds repeated fields into one comma-joined value. That is
+ * correct for ordinary headers and wrong for Set-Cookie, where a comma is legal
+ * inside a cookie's Expires date -- joining them produces cookies no client can
+ * parse. They are returned separately so the caller gets them verbatim.
+ *
+ * @returns {{headers: Object, cookies: string[]}}
+ */
+function flattenResponseHeaders(headers) {
+  const out = {};
+  for (const [key, value] of headers.entries()) {
+    const lower = key.toLowerCase();
+    if (lower === "set-cookie" || HOP_BY_HOP.has(lower)) continue;
+    out[key] = value;
+  }
+  const cookies =
+    typeof headers.getSetCookie === "function" ? headers.getSetCookie() : [];
+  return { headers: out, cookies };
+}
+
+/**
+ * Handle POST /proxy -- forward an HTTP request described by a JSON envelope.
+ */
+async function handleProxy(request, url, env) {
+  if (!env.RELAY_TOKEN) {
+    return jsonError(500, "Server misconfigured");
+  }
+
+  // Auth: same as the SSH path.
+  const token =
+    url.searchParams.get("token") ||
+    (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+
+  if (!(await tokensMatch(token, env.RELAY_TOKEN))) {
+    logProxy("-", request.headers.get("CF-Connecting-IP") || "?", "401 auth failed");
+    return jsonError(401, "Forbidden");
+  }
+
+  // Size guard before reading the body.
+  const cl = parseInt(request.headers.get("Content-Length") || "0", 10);
+  if (cl > MAX_PROXY_BODY) {
+    return jsonError(413, "Request body too large");
+  }
+
+  let envelope;
+  try {
+    const raw = await request.text();
+    if (new Blob([raw]).size > MAX_PROXY_BODY) {
+      return jsonError(413, "Request body too large");
+    }
+    envelope = JSON.parse(raw);
+  } catch {
+    return jsonError(400, "Bad request: invalid JSON");
+  }
+
+  if (envelope === null || typeof envelope !== "object" || Array.isArray(envelope)) {
+    return jsonError(400, "Bad request: envelope must be a JSON object");
+  }
+  if (!envelope.url || typeof envelope.url !== "string") {
+    return jsonError(400, "Bad request: missing or invalid 'url'");
+  }
+  if (!envelope.method || typeof envelope.method !== "string") {
+    return jsonError(400, "Bad request: missing or invalid 'method'");
+  }
+
+  const method = envelope.method.toUpperCase();
+  if (!HTTP_TOKEN_RE.test(method)) {
+    return jsonError(400, "Bad request: invalid 'method'");
+  }
+
+  // Only http(s) is forwarded. The Workers runtime rejects other schemes
+  // anyway, but refusing here keeps the error a documented 400 rather than an
+  // opaque 502, and keeps parity with the Python relay.
+  let parsedTarget;
+  try {
+    parsedTarget = new URL(envelope.url);
+  } catch {
+    return jsonError(400, "Bad request: invalid 'url'");
+  }
+  if (!ALLOWED_SCHEMES.has(parsedTarget.protocol)) {
+    return jsonError(
+      400,
+      `Bad request: unsupported URL scheme: ${parsedTarget.protocol.replace(":", "")}`
+    );
+  }
+
+  // Build the outgoing request. Headers.set() throws on a malformed name or
+  // value; that is a caller error, so report it as 400 rather than a 500.
+  const outHeaders = new Headers();
+  if (envelope.headers && typeof envelope.headers === "object") {
+    try {
+      for (const [k, v] of Object.entries(envelope.headers)) {
+        if (!HOP_BY_HOP.has(k.toLowerCase())) {
+          outHeaders.set(k, String(v));
+        }
+      }
+    } catch (e) {
+      return jsonError(400, `Bad request: invalid header: ${e.message}`);
+    }
+  }
+
+  let outBody = null;
+  if (envelope.body_b64) {
+    if (typeof envelope.body_b64 !== "string") {
+      return jsonError(400, "Bad request: invalid 'body_b64'");
+    }
+    try {
+      // Binary body takes precedence.
+      outBody = Uint8Array.from(atob(envelope.body_b64), (c) => c.charCodeAt(0));
+    } catch {
+      return jsonError(400, "Bad request: invalid 'body_b64': not valid base64");
+    }
+  } else if (envelope.body != null) {
+    if (typeof envelope.body !== "string") {
+      return jsonError(400, "Bad request: invalid 'body': expected a string");
+    }
+    outBody = envelope.body;
+  }
+
+  // Methods that must not have a body per HTTP spec.
+  const noBodyMethods = ["GET", "HEAD"];
+
+  let upstream;
+  try {
+    upstream = await fetch(envelope.url, {
+      method,
+      headers: outHeaders,
+      body: noBodyMethods.includes(method) ? undefined : outBody,
+      redirect: "follow",
+    });
+  } catch (e) {
+    logProxy(method, parsedTarget.host, `502 ${e.message}`);
+    return jsonError(502, `Upstream error: ${e.message}`);
+  }
+
+  const bodyLimit = maxResponseBody(env);
+
+  // Refuse before buffering when the target declares an oversized body. This is
+  // advisory -- Content-Length may be absent or wrong -- so the real check runs
+  // again on the bytes actually received.
+  const declared = parseInt(upstream.headers.get("Content-Length") || "", 10);
+  if (Number.isInteger(declared) && declared > bodyLimit) {
+    logProxy(method, parsedTarget.host, `502 response too large (${declared} bytes)`);
+    return jsonError(502, `Upstream response exceeds ${bodyLimit} bytes`);
+  }
+
+  // The body streams in after the response head, so a connection that dies
+  // mid-transfer fails here rather than at fetch().
+  let respBody;
+  try {
+    respBody = await upstream.arrayBuffer();
+  } catch (e) {
+    logProxy(method, parsedTarget.host, `502 ${e.message}`);
+    return jsonError(502, `Upstream error reading body: ${e.message}`);
+  }
+  const bodyBytes = new Uint8Array(respBody);
+
+  // Checked before encoding, which is where the memory actually triples.
+  if (bodyBytes.length > bodyLimit) {
+    logProxy(method, parsedTarget.host, `502 response too large (${bodyBytes.length} bytes)`);
+    return jsonError(502, `Upstream response exceeds ${bodyLimit} bytes`);
+  }
+
+  // Chunked conversion avoids "Maximum call stack size exceeded" when the
+  // spread operator is used on large arrays (V8 limit is ~125 K arguments).
+  let bodyBin = "";
+  for (let i = 0; i < bodyBytes.length; i += 8192) {
+    bodyBin += String.fromCharCode.apply(
+      null,
+      bodyBytes.subarray(i, Math.min(i + 8192, bodyBytes.length))
+    );
+  }
+  const bodyB64 = btoa(bodyBin);
+
+  const { headers: respHeaders, cookies } = flattenResponseHeaders(upstream.headers);
+  const result = {
+    status: upstream.status,
+    headers: respHeaders,
+    body_b64: bodyB64,
+  };
+  if (cookies.length) {
+    result.set_cookie = cookies;
+  }
+
+  if (upstream.redirected) {
+    result.redirected = true;
+    result.final_url = upstream.url;
+  }
+
+  logProxy(method, parsedTarget.host, String(upstream.status));
+
+  return new Response(JSON.stringify(result), {
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Bridge

@@ -17,7 +17,14 @@
 
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/dial481/cowork-tunnel/main"
+# Where the client scripts are fetched from. Pinned to main by default, but
+# overridable so a branch or a fork can be tested without editing this file:
+#   COWORK_TUNNEL_REF=dev              -- another branch, tag or commit
+#   COWORK_TUNNEL_REPO_RAW=https://... -- an entirely different origin
+# The scripts must match the relay they talk to; fetching a client from main
+# while running a relay from a branch is how you get mismatched behaviour.
+COWORK_TUNNEL_REF="${COWORK_TUNNEL_REF:-main}"
+REPO_RAW="${COWORK_TUNNEL_REPO_RAW:-https://raw.githubusercontent.com/dial481/cowork-tunnel/${COWORK_TUNNEL_REF}}"
 INSTALL_DIR="${COWORK_TUNNEL_DIR:-/tmp/cowork-tunnel}"
 SSH_CONFIG="${HOME}/.ssh/config"
 MARKER_BEGIN="# >>> cowork-tunnel begin >>>"
@@ -47,27 +54,47 @@ if ! python3 -c "import websockets" 2>/dev/null; then
     pip install websockets -q --break-system-packages
 fi
 
-# --- Download the proxy -----------------------------------------------------
+# --- Download the proxy scripts ---------------------------------------------
 # -f makes curl fail on 4xx/5xx. Without it a 404 page is written to disk as
 # ws_proxy.py and the failure only shows up later as a broken SSH session.
 mkdir -p "$INSTALL_DIR"
-TMP_PROXY="$(mktemp "${INSTALL_DIR}/.ws_proxy.XXXXXX.py")"
-trap 'rm -f "$TMP_PROXY"' EXIT
 
-if ! curl -fsSL "${REPO_RAW}/client/ws_proxy.py" -o "$TMP_PROXY"; then
-    echo "[cowork-tunnel] ERROR: failed to download ws_proxy.py from ${REPO_RAW}" >&2
+# Downloads land on a temp file first and are only moved into place once they
+# look right. The trap covers the window in between, so an interrupted run
+# leaves no half-written .ws_proxy.XXXXXX behind.
+TMP_DOWNLOAD=""
+cleanup() {
+    [ -n "$TMP_DOWNLOAD" ] && rm -f "$TMP_DOWNLOAD"
+}
+trap cleanup EXIT INT TERM
+
+download_script() {
+    local name="$1"
+    TMP_DOWNLOAD="$(mktemp "${INSTALL_DIR}/.${name}.XXXXXX")"
+
+    if ! curl -fsSL "${REPO_RAW}/client/${name}" -o "$TMP_DOWNLOAD"; then
+        echo "[cowork-tunnel] ERROR: failed to download ${name} from ${REPO_RAW}" >&2
+        return 1
+    fi
+
+    if ! head -n 1 "$TMP_DOWNLOAD" | grep -q '^#!/usr/bin/env python3'; then
+        echo "[cowork-tunnel] ERROR: downloaded ${name} does not look like the expected script." >&2
+        echo "  First line: $(head -n 1 "$TMP_DOWNLOAD")" >&2
+        return 1
+    fi
+
+    mv "$TMP_DOWNLOAD" "${INSTALL_DIR}/${name}"
+    TMP_DOWNLOAD=""
+    chmod +x "${INSTALL_DIR}/${name}"
+}
+
+if ! download_script "ws_proxy.py"; then
     exit 1
 fi
 
-if ! head -n 1 "$TMP_PROXY" | grep -q '^#!/usr/bin/env python3'; then
-    echo "[cowork-tunnel] ERROR: downloaded ws_proxy.py does not look like the expected script." >&2
-    echo "  First line: $(head -n 1 "$TMP_PROXY")" >&2
-    exit 1
+if ! download_script "http_proxy.py"; then
+    echo "[cowork-tunnel] WARNING: could not download http_proxy.py. HTTP proxy will not be available." >&2
 fi
-
-mv "$TMP_PROXY" "${INSTALL_DIR}/ws_proxy.py"
-trap - EXIT
-chmod +x "${INSTALL_DIR}/ws_proxy.py"
 
 # --- Configure SSH ----------------------------------------------------------
 # Replace any previous block rather than appending a second `Host *` stanza.
@@ -95,3 +122,7 @@ chmod 600 "$SSH_CONFIG"
 echo "[cowork-tunnel] Ready. SSH will tunnel through ${COWORK_RELAY_URL}"
 echo "[cowork-tunnel] Note: the 'Host *' block routes ALL ssh through the tunnel."
 echo "[cowork-tunnel] Test with: ssh user@your-server"
+if [ -f "${INSTALL_DIR}/http_proxy.py" ]; then
+    echo "[cowork-tunnel] HTTP proxy also available:"
+    echo "  python3 ${INSTALL_DIR}/http_proxy.py GET https://example.com"
+fi

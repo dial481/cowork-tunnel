@@ -16,15 +16,26 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
+import json
 import os
+import shutil
+import ssl
 import sys
+import tempfile
 import types
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 from urllib.parse import quote
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RELAY_DIR = os.path.join(REPO, "relay")
 CLIENT = os.path.join(REPO, "client", "ws_proxy.py")
+CLIENT_DIR = os.path.join(REPO, "client")
+
+# Add client dir to path so we can import http_proxy
+sys.path.insert(0, CLIENT_DIR)
 
 try:
     import websockets
@@ -126,9 +137,17 @@ class Relay:
 
     def __init__(self, script: str, env: dict[str, str]):
         self.script = script
-        self.env = env
-        self.port = int(env["WS_PORT"])
+        self.env = dict(env)
+        self.port = int(self.env["WS_PORT"])
+        # universal.py serves the HTTP proxy on its own port. Every instance
+        # gets a distinct one so concurrent relays in this suite cannot collide
+        # on the default.
+        if script == "universal.py":
+            self.env.setdefault("PROXY_PORT", str(alloc_port()))
+        self.proxy_port = int(self.env["PROXY_PORT"]) if "PROXY_PORT" in self.env else None
         self.proc = None
+        # Populated on exit so tests can assert the relay logged no tracebacks.
+        self.stderr_text = ""
 
     async def __aenter__(self):
         env = {**os.environ, "RELAY_TOKEN": TOKEN, **self.env}
@@ -139,18 +158,26 @@ class Relay:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Probe the LAST port the relay binds. universal.py binds the
+        # WebSocket listener before the HTTP one, so a reachable proxy port
+        # means both are up -- and probing the WebSocket port would open and
+        # drop a connection without sending a request line, which websockets
+        # 14.1 through 16.0 log a traceback for. That noise would defeat the
+        # "relay logged no unhandled exceptions" assertion.
+        wanted = [self.proxy_port] if self.proxy_port else [self.port]
         for _ in range(60):
             await asyncio.sleep(0.1)
             if self.proc.returncode is not None:
                 err = (await self.proc.stderr.read()).decode()
                 raise RuntimeError(f"{self.script} exited rc={self.proc.returncode}: {err}")
             try:
-                _r, w = await asyncio.open_connection("127.0.0.1", self.port)
-                w.close()
+                for port in wanted:
+                    _r, w = await asyncio.open_connection("127.0.0.1", port)
+                    w.close()
                 return self
             except OSError:
                 continue
-        raise RuntimeError(f"{self.script} never bound port {self.port}")
+        raise RuntimeError(f"{self.script} never bound ports {wanted}")
 
     async def __aexit__(self, *_exc):
         if self.proc and self.proc.returncode is None:
@@ -160,6 +187,12 @@ class Relay:
             except asyncio.TimeoutError:
                 self.proc.kill()
                 await self.proc.wait()
+        if self.proc and self.proc.stderr is not None:
+            try:
+                data = await asyncio.wait_for(self.proc.stderr.read(), timeout=5)
+                self.stderr_text = data.decode("utf-8", errors="replace")
+            except (asyncio.TimeoutError, ValueError):
+                self.stderr_text = ""
 
     def url(self, query: str = "") -> str:
         base = f"ws://127.0.0.1:{self.port}/ssh?token={TOKEN}"
@@ -497,6 +530,1064 @@ async def test_ws_proxy_client(sshd_port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mock HTTP server for proxy tests
+# ---------------------------------------------------------------------------
+class _MockHTTPHandler(BaseHTTPRequestHandler):
+    """A simple HTTP handler for testing the HTTP proxy path."""
+
+    def log_message(self, format, *args):
+        pass  # suppress log output during tests
+
+    def do_GET(self):
+        if self.path == "/json":
+            body = json.dumps({"greeting": "hello", "source": "mock"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("X-Custom-Header", "test-value")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/error500":
+            body = b"Internal Server Error"
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/echo-headers":
+            # Return the received headers as JSON
+            headers_dict = {k: v for k, v in self.headers.items()}
+            body = json.dumps(headers_dict).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/big":
+            # Deterministic filler, large enough to cross several socket reads.
+            body = (b"cowork-tunnel-" * 4096) * 32  # ~1.8 MiB
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/json")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/redirect-evil":
+            # A cooperative-looking target that tries to bounce the relay onto
+            # its own filesystem.
+            self.send_response(302)
+            self.send_header("Location", "file:///etc/passwd")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/cookies":
+            # Two Set-Cookie headers, one carrying a comma inside its Expires
+            # date -- exactly the case that comma-joining corrupts.
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Set-Cookie", "a=1; Path=/")
+            self.send_header(
+                "Set-Cookie", "b=2; Expires=Wed, 21 Oct 2026 07:28:00 GMT; Path=/"
+            )
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/dupe-headers":
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("X-Multi", "one")
+            self.send_header("X-Multi", "two")
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = b"Not Found"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length else b""
+
+        if self.path == "/echo":
+            # Echo back the body with the content-type and a custom header
+            self.send_response(200)
+            ct = self.headers.get("Content-Type", "application/octet-stream")
+            self.send_header("Content-Type", ct)
+            self.send_header("X-Echo", "true")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            resp = b"Not Found"
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+
+def start_mock_http_server(port: int) -> HTTPServer:
+    """Start a mock HTTP server in a background thread."""
+    server = HTTPServer(("127.0.0.1", port), _MockHTTPHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+# ---------------------------------------------------------------------------
+# HTTP Proxy unit tests
+# ---------------------------------------------------------------------------
+def test_http_proxy_url_normalization() -> None:
+    print("\nHTTP proxy URL normalization (client/http_proxy.py):")
+    from http_proxy import _normalize_relay_url
+
+    cases = [
+        ("wss://relay.example.com/ssh?target=host:22&token=xxx",
+         "https://relay.example.com/proxy"),
+        ("wss://relay.example.com/ssh",
+         "https://relay.example.com/proxy"),
+        ("ws://localhost:8765/ssh",
+         "http://localhost:8765/proxy"),
+        ("https://relay.example.com",
+         "https://relay.example.com/proxy"),
+        ("https://relay.example.com/some/path",
+         "https://relay.example.com/proxy"),
+        ("http://127.0.0.1:9000",
+         "http://127.0.0.1:9000/proxy"),
+    ]
+    for raw, want in cases:
+        got = _normalize_relay_url(raw)
+        check(f"normalize {raw!r}", got == want, f"got {got!r}, want {want!r}")
+
+
+def test_http_proxy_header_stripping() -> None:
+    print("\nHTTP proxy hop-by-hop header stripping (client/http_proxy.py):")
+    from http_proxy import _strip_hop_by_hop
+
+    headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+        "Authorization": "Bearer token",
+        "Transfer-Encoding": "chunked",
+        "X-Custom": "value",
+        "Keep-Alive": "timeout=5",
+    }
+    stripped = _strip_hop_by_hop(headers)
+    check("keeps Content-Type", "Content-Type" in stripped)
+    check("keeps Authorization", "Authorization" in stripped)
+    check("keeps X-Custom", "X-Custom" in stripped)
+    check("strips Connection", "Connection" not in stripped)
+    check("strips Transfer-Encoding", "Transfer-Encoding" not in stripped)
+    check("strips Keep-Alive", "Keep-Alive" not in stripped)
+
+
+# ---------------------------------------------------------------------------
+# HTTP Proxy integration tests (through universal relay)
+# ---------------------------------------------------------------------------
+def _proxy_request(relay_port: int, envelope: dict, token: str = TOKEN) -> dict:
+    """Send a raw HTTP POST /proxy to the relay and return the parsed response."""
+    import urllib.request
+    import urllib.error
+
+    payload = json.dumps(envelope).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{relay_port}/proxy",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        try:
+            return {"_http_status": e.code, **json.loads(body)}
+        except (json.JSONDecodeError, ValueError):
+            return {"_http_status": e.code, "_body": body.decode("utf-8", errors="replace")}
+
+
+def _proxy_request_raw(relay_port: int, envelope: dict, token: str = TOKEN):
+    """Send a raw HTTP request and return (http_status, parsed_body)."""
+    import urllib.request
+    import urllib.error
+
+    payload = json.dumps(envelope).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{relay_port}/proxy",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        try:
+            return e.code, json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return e.code, {"_body": body.decode("utf-8", errors="replace")}
+
+
+async def test_http_proxy(sshd_port: int) -> None:
+    print("\nHTTP proxy through universal relay:")
+
+    mock_http_port = alloc_port()
+    mock_server = start_mock_http_server(mock_http_port)
+
+    env = {"WS_PORT": str(alloc_port()), "RATE_LIMIT": "1000"}
+    try:
+        async with Relay("universal.py", env) as relay:
+            # Test 1: Auth rejection on bad token
+            status, resp = await asyncio.to_thread(
+                _proxy_request_raw, relay.proxy_port,
+                {"url": f"http://127.0.0.1:{mock_http_port}/json", "method": "GET"},
+                "WRONG-TOKEN",
+            )
+            check("HTTP proxy rejects bad token with 401", status == 401,
+                  f"got status {status}")
+
+            # Test 2: Auth rejection on missing token
+            status, resp = await asyncio.to_thread(
+                _proxy_request_raw, relay.proxy_port,
+                {"url": f"http://127.0.0.1:{mock_http_port}/json", "method": "GET"},
+                "",
+            )
+            check("HTTP proxy rejects missing token with 401", status == 401,
+                  f"got status {status}")
+
+            # Test 3: Successful GET with JSON response
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {"url": f"http://127.0.0.1:{mock_http_port}/json", "method": "GET"},
+            )
+            check("HTTP proxy GET returns status 200", result.get("status") == 200,
+                  f"got {result.get('status')}")
+            body = base64.b64decode(result.get("body_b64", ""))
+            parsed = json.loads(body)
+            check("HTTP proxy GET body round-trip", parsed.get("greeting") == "hello",
+                  f"body={parsed}")
+            check("HTTP proxy GET preserves response headers",
+                  result.get("headers", {}).get("X-Custom-Header") == "test-value",
+                  f"headers={result.get('headers')}")
+
+            # Test 4: POST with JSON body
+            post_body = json.dumps({"message": "test post"})
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {
+                    "url": f"http://127.0.0.1:{mock_http_port}/echo",
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/json"},
+                    "body": post_body,
+                },
+            )
+            check("HTTP proxy POST returns status 200", result.get("status") == 200,
+                  f"got {result.get('status')}")
+            resp_body = base64.b64decode(result.get("body_b64", ""))
+            check("HTTP proxy POST body echoed correctly", resp_body == post_body.encode(),
+                  f"got {resp_body!r}")
+
+            # Test 5: Binary body via body_b64
+            binary_data = bytes(range(256))
+            b64_data = base64.b64encode(binary_data).decode("ascii")
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {
+                    "url": f"http://127.0.0.1:{mock_http_port}/echo",
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/octet-stream"},
+                    "body_b64": b64_data,
+                },
+            )
+            check("HTTP proxy binary body_b64 returns 200", result.get("status") == 200,
+                  f"got {result.get('status')}")
+            resp_body = base64.b64decode(result.get("body_b64", ""))
+            check("HTTP proxy binary body round-trip", resp_body == binary_data,
+                  f"got {len(resp_body)} bytes, want {len(binary_data)}")
+
+            # Test 6: Target error (500) passes through
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {"url": f"http://127.0.0.1:{mock_http_port}/error500", "method": "GET"},
+            )
+            check("HTTP proxy passes through 500 status", result.get("status") == 500,
+                  f"got {result.get('status')}")
+
+            # Test 7: Unreachable target returns 502 with a JSON error body
+            unreachable_port = alloc_port()  # Nothing listening
+            status, result = await asyncio.to_thread(
+                _proxy_request_raw, relay.proxy_port,
+                {"url": f"http://127.0.0.1:{unreachable_port}/anything", "method": "GET"},
+            )
+            check("HTTP proxy returns 502 for unreachable target", status == 502,
+                  f"got status {status}")
+            check("HTTP proxy 502 carries a JSON error", "error" in result,
+                  f"result={result}")
+
+            # Test 8: Bad JSON returns 400
+            import urllib.request
+            import urllib.error
+            bad_req = urllib.request.Request(
+                f"http://127.0.0.1:{relay.proxy_port}/proxy",
+                data=b"not-json",
+                method="POST",
+            )
+            bad_req.add_header("Content-Type", "application/json")
+            bad_req.add_header("Authorization", f"Bearer {TOKEN}")
+            try:
+                with urllib.request.urlopen(bad_req, timeout=10) as resp:
+                    status = resp.status
+            except urllib.error.HTTPError as e:
+                status = e.code
+            check("HTTP proxy rejects bad JSON with 400", status == 400,
+                  f"got {status}")
+
+            # Test 9: Missing required fields returns 400
+            status, resp = await asyncio.to_thread(
+                _proxy_request_raw, relay.proxy_port,
+                {"url": f"http://127.0.0.1:{mock_http_port}/json"},  # missing method
+            )
+            check("HTTP proxy rejects missing 'method' with 400", status == 400,
+                  f"got status {status}")
+
+            # Test 10: Headers forwarded to target
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {
+                    "url": f"http://127.0.0.1:{mock_http_port}/echo-headers",
+                    "method": "GET",
+                    "headers": {"X-Test-Header": "forwarded-value"},
+                },
+            )
+            resp_body = base64.b64decode(result.get("body_b64", ""))
+            echoed_headers = json.loads(resp_body)
+            check("HTTP proxy forwards custom headers to target",
+                  echoed_headers.get("X-Test-Header") == "forwarded-value",
+                  f"echoed={echoed_headers}")
+
+            # Test 11: WebSocket SSH still works after HTTP proxy usage
+            try:
+                async with connect(
+                    relay.url(f"&target=127.0.0.1:{sshd_port}"), open_timeout=5
+                ) as ws:
+                    banner = await asyncio.wait_for(ws.recv(), timeout=5)
+                    banner = banner if isinstance(banner, bytes) else banner.encode()
+                    check(
+                        "SSH still works after HTTP proxy requests",
+                        banner.startswith(b"SSH-2.0"),
+                        banner.decode().strip(),
+                    )
+            except Exception as e:
+                check("SSH still works after HTTP proxy requests", False,
+                      f"{type(e).__name__}: {e}")
+
+    finally:
+        mock_server.shutdown()
+
+
+async def _raw_request(port: int, request: bytes,
+                       read_timeout: float = 5.0) -> tuple[bytes, bool]:
+    """Send raw bytes to the relay.
+
+    Returns (response_bytes, server_closed). server_closed is True only if the
+    relay hung up on its own, which is what `Connection: close` promises.
+    """
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    data = b""
+    closed = False
+    try:
+        writer.write(request)
+        await writer.drain()
+        while True:
+            chunk = await asyncio.wait_for(reader.read(65536), timeout=read_timeout)
+            if not chunk:
+                closed = True
+                break
+            data += chunk
+    except (asyncio.TimeoutError, ConnectionError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+    return data, closed
+
+
+def _status_line(response: bytes) -> int:
+    """Extract the numeric status from a raw HTTP response."""
+    try:
+        return int(response.split(b" ", 2)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _post_proxy(envelope: dict, token: str = TOKEN,
+                content_length: int | None = None,
+                extra_headers: bytes = b"") -> bytes:
+    """Build a raw POST /proxy request."""
+    payload = json.dumps(envelope).encode()
+    length = len(payload) if content_length is None else content_length
+    return (
+        b"POST /proxy HTTP/1.1\r\nHost: relay\r\n"
+        + f"Authorization: Bearer {token}\r\n".encode()
+        + b"Content-Type: application/json\r\n"
+        + f"Content-Length: {length}\r\n".encode()
+        + extra_headers
+        + b"\r\n"
+        + payload
+    )
+
+
+async def test_http_proxy_hardening(sshd_port: int) -> None:
+    """Malformed, oversized and hostile requests must fail cleanly.
+
+    Every case here reached a hang, a leaked connection or a stack trace before
+    the HTTP path was rewritten, so each one is a regression guard.
+    """
+    print("\nHTTP proxy hardening (relay/universal.py):")
+
+    mock_http_port = alloc_port()
+    mock_server = start_mock_http_server(mock_http_port)
+    target = f"http://127.0.0.1:{mock_http_port}/json"
+
+    env = {"WS_PORT": str(alloc_port()), "RATE_LIMIT": "1000", "PROXY_RATE_LIMIT": "1000"}
+    try:
+        async with Relay("universal.py", env) as relay:
+            # The relay promises Connection: close and must deliver it. A relay
+            # that answers but never hangs up leaks a descriptor per request.
+            resp, closed = await _raw_request(
+                relay.proxy_port, _post_proxy({"url": target, "method": "GET"})
+            )
+            check("proxy response closes the connection", closed,
+                  "relay answered but left the socket open")
+            check("proxy response is 200", _status_line(resp) == 200,
+                  f"got {_status_line(resp)}")
+
+            # Non-HTTP schemes would turn the proxy into a file reader.
+            for scheme_url, label in [
+                ("file:///etc/passwd", "file://"),
+                ("ftp://127.0.0.1/x", "ftp://"),
+                ("data:text/plain,hello", "data:"),
+            ]:
+                resp, _ = await _raw_request(
+                    relay.proxy_port, _post_proxy({"url": scheme_url, "method": "GET"})
+                )
+                status = _status_line(resp)
+                check(f"proxy refuses {label} with 400", status == 400, f"got {status}")
+                check(f"proxy leaks nothing for {label}",
+                      b"root:" not in resp and b"/bin/" not in resp,
+                      "response contained file content")
+
+            # A redirect is followed by the relay, so the scheme guard has to
+            # hold on the redirect target too, not just the requested URL.
+            resp, _ = await _raw_request(
+                relay.proxy_port,
+                _post_proxy({"url": f"http://127.0.0.1:{mock_http_port}/redirect-evil",
+                             "method": "GET"}),
+                read_timeout=8.0,
+            )
+            check("redirect to file:// does not leak file contents",
+                  b"root:" not in resp and b"/bin/" not in resp,
+                  f"got {resp[:160]!r}")
+
+            # Malformed envelopes must produce an answer, not a hang.
+            for envelope, label in [
+                ({"url": target, "method": "POST", "body_b64": "!!!not-base64!!!"},
+                 "invalid body_b64"),
+                ({"url": target, "method": "GET HTTP/1.1"}, "invalid method"),
+                ({"url": "not-a-url", "method": "GET"}, "unparseable url"),
+                ({"url": target, "method": "GET", "headers": {"X-Bad": "a\r\nInjected: 1"}},
+                 "header injection"),
+                ({"url": target, "method": "GET", "headers": {"Bad Name": "v"}},
+                 "invalid header name"),
+            ]:
+                resp, closed = await _raw_request(relay.proxy_port, _post_proxy(envelope))
+                status = _status_line(resp)
+                check(f"proxy rejects {label} with 400", status == 400, f"got {status}")
+                check(f"proxy answers at all for {label}", bool(resp), "no response")
+
+            # A JSON array is valid JSON but not a valid envelope.
+            resp, _ = await _raw_request(
+                relay.proxy_port,
+                b"POST /proxy HTTP/1.1\r\nHost: relay\r\n"
+                + f"Authorization: Bearer {TOKEN}\r\n".encode()
+                + b"Content-Length: 2\r\n\r\n[]",
+            )
+            check("proxy rejects non-object envelope with 400",
+                  _status_line(resp) == 400, f"got {_status_line(resp)}")
+
+            # A bad Content-Length used to raise ValueError inside the protocol
+            # and drop the connection with no response at all.
+            resp, _ = await _raw_request(
+                relay.proxy_port,
+                b"POST /proxy HTTP/1.1\r\nHost: relay\r\n"
+                + f"Authorization: Bearer {TOKEN}\r\n".encode()
+                + b"Content-Length: abc\r\n\r\n{}",
+            )
+            check("proxy rejects non-numeric Content-Length with 400",
+                  _status_line(resp) == 400, f"got {_status_line(resp)}")
+
+            resp, _ = await _raw_request(
+                relay.proxy_port,
+                b"POST /proxy HTTP/1.1\r\nHost: relay\r\n"
+                + f"Authorization: Bearer {TOKEN}\r\n".encode()
+                + b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            )
+            check("proxy rejects chunked encoding with 411",
+                  _status_line(resp) == 411, f"got {_status_line(resp)}")
+
+            # Routing
+            resp, _ = await _raw_request(
+                relay.proxy_port, b"GET /proxy HTTP/1.1\r\nHost: relay\r\n\r\n"
+            )
+            check("GET /proxy returns 405", _status_line(resp) == 405,
+                  f"got {_status_line(resp)}")
+
+            resp, _ = await _raw_request(
+                relay.proxy_port, b"GET /nope HTTP/1.1\r\nHost: relay\r\n\r\n"
+            )
+            check("unknown path on the proxy port returns 404",
+                  _status_line(resp) == 404, f"got {_status_line(resp)}")
+
+            resp, closed = await _raw_request(
+                relay.proxy_port, b"HEAD /health HTTP/1.1\r\nHost: relay\r\n\r\n"
+            )
+            check("HEAD /health returns 200", _status_line(resp) == 200,
+                  f"got {_status_line(resp)}")
+            check("health response closes the connection", closed)
+            # RFC 9110: a HEAD response carries the GET's headers and no body.
+            # nginx hides this in the documented deployment; a direct connection
+            # does not.
+            head_end = resp.find(b"\r\n\r\n")
+            check("HEAD /health sends no body",
+                  head_end != -1 and resp[head_end + 4:] == b"",
+                  f"body={resp[head_end + 4:][:60]!r}")
+            check("HEAD /health still declares Content-Length",
+                  b"content-length:" in resp.lower(), f"got {resp[:120]!r}")
+
+            resp, _ = await _raw_request(
+                relay.proxy_port, b"GET /health HTTP/1.1\r\nHost: relay\r\n\r\n"
+            )
+            check("GET /health does send a body",
+                  resp.split(b"\r\n\r\n", 1)[-1].startswith(b"{"),
+                  f"got {resp[-80:]!r}")
+
+            resp, _ = await _raw_request(
+                relay.proxy_port,
+                b"GET /health HTTP/1.1\r\nHost: relay\r\nX-Pad: "
+                + b"A" * 40000 + b"\r\n\r\n",
+            )
+            check("oversized request head returns 431", _status_line(resp) == 431,
+                  f"got {_status_line(resp)}")
+
+            # Expect: 100-continue is what curl sends ahead of a large body.
+            resp, _ = await _raw_request(
+                relay.proxy_port,
+                _post_proxy({"url": target, "method": "GET"},
+                            extra_headers=b"Expect: 100-continue\r\n"),
+            )
+            check("Expect: 100-continue is honoured",
+                  b"100 Continue" in resp and b"200 OK" in resp,
+                  f"got {resp[:80]!r}")
+
+        check("relay logged no unhandled exceptions",
+              "Task exception was never retrieved" not in relay.stderr_text
+              and "Traceback" not in relay.stderr_text,
+              relay.stderr_text[-300:])
+
+        # Port separation, on its own relay. websockets logs a traceback of its
+        # own when handed a POST (14.1 through 16.0 raise "unsupported HTTP
+        # method"), which is the library's noise rather than ours -- keeping it
+        # off the relay above lets that log-cleanliness check stay strict.
+        env = {"WS_PORT": str(alloc_port()), "PROXY_RATE_LIMIT": "1000"}
+        async with Relay("universal.py", env) as split:
+            # The SSH port is websockets' own listener; a plain GET there must
+            # still get the documented 426, matching the Cloudflare Worker.
+            resp, _ = await _raw_request(
+                split.port, b"GET /ssh HTTP/1.1\r\nHost: relay\r\n\r\n"
+            )
+            check("plain GET on the SSH port returns 426",
+                  _status_line(resp) == 426, f"got {_status_line(resp)}")
+
+            resp, _ = await _raw_request(
+                split.port, _post_proxy({"url": target, "method": "GET"})
+            )
+            check("SSH port does not serve /proxy", _status_line(resp) != 200,
+                  f"got {_status_line(resp)}")
+
+            resp, _ = await _raw_request(
+                split.proxy_port,
+                b"GET /ssh HTTP/1.1\r\nHost: relay\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                b"Sec-WebSocket-Version: 13\r\n\r\n",
+            )
+            check("proxy port does not serve WebSocket upgrades",
+                  _status_line(resp) == 404, f"got {_status_line(resp)}")
+
+        # Limits need their own relay so the thresholds can be driven down to
+        # something a test can reach cheaply.
+        env = {
+            "WS_PORT": str(alloc_port()),
+            "RATE_LIMIT": "1000",
+            "PROXY_RATE_LIMIT": "3",
+            "MAX_PROXY_BODY": "2048",
+            "HEAD_TIMEOUT": "1",
+        }
+        async with Relay("universal.py", env) as limited:
+            oversized = {"url": target, "method": "POST", "body_b64":
+                         base64.b64encode(b"x" * 4096).decode()}
+            resp, closed = await _raw_request(limited.proxy_port, _post_proxy(oversized))
+            check("oversized body returns a readable 413",
+                  _status_line(resp) == 413, f"got {_status_line(resp)}")
+            check("413 arrives as JSON, not a reset", b'"error"' in resp,
+                  f"got {resp[:120]!r}")
+
+            statuses = []
+            for _ in range(5):
+                resp, _ = await _raw_request(
+                    limited.proxy_port, _post_proxy({"url": target, "method": "GET"})
+                )
+                statuses.append(_status_line(resp))
+            check("proxy rate limit returns 429", 429 in statuses, f"got {statuses}")
+
+            # A connection that opens and says nothing must not be held forever.
+            start = asyncio.get_running_loop().time()
+            reader, writer = await asyncio.open_connection("127.0.0.1", limited.proxy_port)
+            try:
+                data = await asyncio.wait_for(reader.read(65536), timeout=6)
+                elapsed = asyncio.get_running_loop().time() - start
+                check("idle connection is timed out", elapsed < 5,
+                      f"took {elapsed:.1f}s")
+                check("idle connection gets 408", _status_line(data) == 408,
+                      f"got {_status_line(data)}")
+            except asyncio.TimeoutError:
+                check("idle connection is timed out", False, "still open after 6s")
+                check("idle connection gets 408", False, "no response")
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
+    finally:
+        mock_server.shutdown()
+
+
+def test_env_parsing() -> None:
+    """Garbage in the environment must not crash a relay at import time.
+
+    A typo in a systemd env file used to take standalone.py down with an
+    unhandled ValueError before it could log anything useful.
+    """
+    print("\nEnvironment parsing (relay/*.py):")
+
+    for script, keys in [
+        ("universal.py", ["WS_PORT", "PROXY_PORT", "MAX_CONNECTIONS", "RATE_LIMIT"]),
+        ("standalone.py", ["WS_PORT", "SSH_PORT", "MAX_CONNECTIONS", "RATE_LIMIT"]),
+    ]:
+        defaults = load_relay(script, {"RELAY_TOKEN": TOKEN})
+        for bad in ("not-a-number", "", "-5", "0"):
+            try:
+                mod = load_relay(script, {"RELAY_TOKEN": TOKEN, **{k: bad for k in keys}})
+            except Exception as e:  # noqa: BLE001 - the point is that it must not raise
+                check(f"{script} survives {keys[0]}={bad!r}", False,
+                      f"{type(e).__name__}: {e}")
+                continue
+            ok = all(
+                isinstance(getattr(mod, k), int) and getattr(mod, k) == getattr(defaults, k)
+                for k in keys
+            )
+            check(f"{script} falls back to defaults on {bad!r}", ok,
+                  {k: getattr(mod, k) for k in keys})
+
+        good = load_relay(script, {"RELAY_TOKEN": TOKEN, keys[0]: "9999"})
+        check(f"{script} still honours a valid {keys[0]}",
+              getattr(good, keys[0]) == 9999, f"got {getattr(good, keys[0])}")
+
+
+async def test_no_permessage_deflate(sshd_port: int) -> None:
+    """The relays must decline permessage-deflate.
+
+    websockets negotiates it by default, and this tunnel carries SSH -- an
+    encrypted stream that cannot compress. Leaving it on cost roughly 17x
+    throughput (12.5 MiB/s against 220 MiB/s on 100 MiB of random data) to
+    produce slightly larger frames. Asserted against the handshake response so
+    the check does not depend on library internals.
+    """
+    print("\nWebSocket compression (relay/*.py):")
+
+    handshake = (
+        b"GET /ssh HTTP/1.1\r\n"
+        b"Host: relay\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n"
+        b"Sec-WebSocket-Extensions: permessage-deflate\r\n"
+        b"\r\n"
+    )
+
+    for script, env in [
+        ("universal.py", {"WS_PORT": str(alloc_port())}),
+        ("standalone.py", {"WS_PORT": str(alloc_port()), "SSH_PORT": str(sshd_port)}),
+    ]:
+        async with Relay(script, env) as relay:
+            resp, _ = await _raw_request(relay.port, handshake, read_timeout=3.0)
+            lowered = resp.lower()
+            check(f"{script} completes the handshake",
+                  b"101" in resp.split(b"\r\n")[0], f"got {resp.split(b'!r')[0][:60]!r}")
+            check(f"{script} declines permessage-deflate",
+                  b"sec-websocket-extensions" not in lowered,
+                  f"got {resp[:200]!r}")
+
+
+async def test_upstream_tls_verification() -> None:
+    """The relay must verify upstream certificates unless told not to.
+
+    The relay is the hop that carries forwarded credentials onto the real
+    internet, so a silent return to CERT_NONE would be a security regression
+    with no visible symptom. Needs the openssl CLI to mint a throwaway cert; if
+    it is unavailable the checks are reported as skipped rather than passed.
+    """
+    print("\nUpstream TLS verification (relay/universal.py):")
+
+    if shutil.which("openssl") is None:
+        print("  [SKIP] openssl not available; cannot mint a self-signed cert")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cert = os.path.join(tmp, "cert.pem")
+        key = os.path.join(tmp, "key.pem")
+        proc = await asyncio.create_subprocess_exec(
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key,
+            "-out", cert, "-days", "1", "-nodes", "-subj", "/CN=localhost",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        if await proc.wait() != 0:
+            print("  [SKIP] openssl could not generate a test certificate")
+            return
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        https_port = alloc_port()
+        server = HTTPServer(("127.0.0.1", https_port), _MockHTTPHandler)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        target = {"url": f"https://localhost:{https_port}/json", "method": "GET"}
+        try:
+            env = {"WS_PORT": str(alloc_port()), "PROXY_RATE_LIMIT": "1000"}
+            async with Relay("universal.py", env) as relay:
+                status, result = await asyncio.to_thread(
+                    _proxy_request_raw, relay.proxy_port, target
+                )
+                check("self-signed upstream is refused by default", status == 502,
+                      f"got status {status}")
+                check("refusal names the certificate as the cause",
+                      "CERTIFICATE_VERIFY_FAILED" in str(result.get("error", "")),
+                      f"got {result.get('error')}")
+
+            env = {
+                "WS_PORT": str(alloc_port()),
+                "PROXY_RATE_LIMIT": "1000",
+                "INSECURE_UPSTREAM_TLS": "1",
+            }
+            async with Relay("universal.py", env) as relay:
+                result = await asyncio.to_thread(_proxy_request, relay.proxy_port, target)
+                check("INSECURE_UPSTREAM_TLS=1 allows it through",
+                      result.get("status") == 200, f"got {result.get('status')}")
+        finally:
+            server.shutdown()
+
+
+async def test_http_proxy_fidelity(sshd_port: int) -> None:
+    """Large bodies, redirects, cookies and duplicate headers survive the trip."""
+    print("\nHTTP proxy response fidelity (relay/universal.py):")
+
+    mock_http_port = alloc_port()
+    mock_server = start_mock_http_server(mock_http_port)
+    base = f"http://127.0.0.1:{mock_http_port}"
+
+    env = {"WS_PORT": str(alloc_port()), "RATE_LIMIT": "1000", "PROXY_RATE_LIMIT": "1000"}
+    try:
+        async with Relay("universal.py", env) as relay:
+            expected_big = (b"cowork-tunnel-" * 4096) * 32
+
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port, {"url": f"{base}/big", "method": "GET"}
+            )
+            body = base64.b64decode(result.get("body_b64", ""))
+            check("large response is not truncated", body == expected_big,
+                  f"got {len(body)} bytes, want {len(expected_big)}")
+
+            # A body larger than the HTTP server's stream limit must still be
+            # read in full -- the head is size-capped, the body must not be.
+            upload = bytes(range(256)) * 4096  # 1 MiB, deterministic
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {
+                    "url": f"{base}/echo",
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/octet-stream"},
+                    "body_b64": base64.b64encode(upload).decode(),
+                },
+            )
+            echoed = base64.b64decode(result.get("body_b64", ""))
+            check("large request body round-trips intact", echoed == upload,
+                  f"got {len(echoed)} bytes, want {len(upload)}")
+
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port, {"url": f"{base}/redirect", "method": "GET"}
+            )
+            check("redirect is followed to the final response",
+                  result.get("status") == 200, f"got {result.get('status')}")
+            check("redirect sets redirected", result.get("redirected") is True,
+                  f"got {result.get('redirected')}")
+            check("redirect reports final_url",
+                  str(result.get("final_url", "")).endswith("/json"),
+                  f"got {result.get('final_url')}")
+
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port, {"url": f"{base}/cookies", "method": "GET"}
+            )
+            cookies = result.get("set_cookie") or []
+            check("Set-Cookie headers are returned separately", len(cookies) == 2,
+                  f"got {cookies}")
+            check("Set-Cookie values are not comma-joined",
+                  any(c.startswith("b=2;") for c in cookies), f"got {cookies}")
+            check("Set-Cookie is kept out of the flat header dict",
+                  "Set-Cookie" not in (result.get("headers") or {}),
+                  f"headers={result.get('headers')}")
+
+            # Proxy-Authorization and Trailer are hop-by-hop and, unlike
+            # Connection, are not re-added by the outbound transport -- their
+            # absence at the target is real evidence the relay dropped them.
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {
+                    "url": f"{base}/echo-headers",
+                    "method": "GET",
+                    "headers": {
+                        "X-Test-Header": "forwarded-value",
+                        "Proxy-Authorization": "Basic c2hvdWxkLW5vdC1sZWFr",
+                        "Trailer": "X-Checksum",
+                    },
+                },
+            )
+            echoed = json.loads(base64.b64decode(result.get("body_b64", "")))
+            lowered = {k.lower(): v for k, v in echoed.items()}
+            check("custom headers reach the target",
+                  lowered.get("x-test-header") == "forwarded-value", f"echoed={lowered}")
+            check("hop-by-hop Proxy-Authorization is stripped",
+                  "proxy-authorization" not in lowered, f"echoed={lowered}")
+            check("hop-by-hop Trailer is stripped", "trailer" not in lowered,
+                  f"echoed={lowered}")
+
+            # A forwarding proxy must not invent request headers. urllib stamps
+            # "Python-urllib/x.y" onto any request without one, which made the
+            # relay misrepresent the caller, diverge from the Worker (which adds
+            # nothing), and hand targets the exact agent string Cloudflare-
+            # fronted sites reject.
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {"url": f"{base}/echo-headers", "method": "GET"},
+            )
+            echoed = json.loads(base64.b64decode(result.get("body_b64", "")))
+            lowered = {k.lower(): v for k, v in echoed.items()}
+            check("relay invents no User-Agent when the envelope has none",
+                  "user-agent" not in lowered, f"got {lowered.get('user-agent')!r}")
+
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port,
+                {
+                    "url": f"{base}/echo-headers",
+                    "method": "GET",
+                    "headers": {"User-Agent": "envelope-agent"},
+                },
+            )
+            echoed = json.loads(base64.b64decode(result.get("body_b64", "")))
+            lowered = {k.lower(): v for k, v in echoed.items()}
+            check("relay forwards the envelope's User-Agent verbatim",
+                  lowered.get("user-agent") == "envelope-agent",
+                  f"got {lowered.get('user-agent')!r}")
+
+            result = await asyncio.to_thread(
+                _proxy_request, relay.proxy_port, {"url": f"{base}/dupe-headers", "method": "GET"}
+            )
+            check("duplicate headers are joined with ', '",
+                  (result.get("headers") or {}).get("X-Multi") == "one, two",
+                  f"got {(result.get('headers') or {}).get('X-Multi')}")
+
+            # An SSH tunnel must still come up on the same port afterwards.
+            async with connect(
+                relay.url(f"&target=127.0.0.1:{sshd_port}"), open_timeout=5
+            ) as ws:
+                banner = await asyncio.wait_for(ws.recv(), timeout=5)
+                banner = banner if isinstance(banner, bytes) else banner.encode()
+                check("SSH works alongside the HTTP proxy",
+                      banner.startswith(b"SSH-2.0"), banner.decode().strip())
+    finally:
+        mock_server.shutdown()
+
+
+def test_http_proxy_client_unit() -> None:
+    """Unit tests for the http_proxy.py client."""
+    print("\nHTTP proxy client unit tests:")
+    from http_proxy import _build_parser
+
+    # Test the CLI argument parser
+    parser = _build_parser()
+
+    args = parser.parse_args(["GET", "https://example.com"])
+    check("CLI parser: method", args.method == "GET")
+    check("CLI parser: url", args.url == "https://example.com")
+    check("CLI parser: no headers", args.headers == [])
+    check("CLI parser: no body", args.body is None)
+    check("CLI parser: not raw", args.raw is False)
+
+    args = parser.parse_args([
+        "POST", "https://api.example.com",
+        "-H", "Content-Type: application/json",
+        "-H", "Authorization: Bearer tok",
+        "-d", '{"key": "val"}',
+        "--raw",
+    ])
+    check("CLI parser: POST method", args.method == "POST")
+    check("CLI parser: headers parsed", len(args.headers) == 2)
+    check("CLI parser: body parsed", args.body == '{"key": "val"}')
+    check("CLI parser: raw flag", args.raw is True)
+
+
+def test_http_proxy_client_useragent() -> None:
+    """The client must not reach a relay as "Python-urllib".
+
+    Cloudflare's edge blocks that agent outright: a Worker-hosted relay answers
+    403 (error 1010) before the request ever reaches the Worker, so the default
+    urllib agent makes the HTTP proxy unusable on the Cloudflare deployment.
+    Verified against the live edge, not inferred.
+    """
+    print("\nHTTP proxy client User-Agent (client/http_proxy.py):")
+    from http_proxy import RELAY_USER_AGENT, relay_fetch
+
+    seen: list[str] = []
+    envelopes: list[dict] = []
+
+    class _Recorder(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # noqa: ANN001
+            pass
+
+        def do_POST(self):
+            seen.append(self.headers.get("User-Agent", ""))
+            length = int(self.headers.get("Content-Length", 0))
+            envelopes.append(json.loads(self.rfile.read(length) or b"{}"))
+            body = json.dumps({"status": 200, "headers": {}, "body_b64": ""}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    port = alloc_port()
+    server = HTTPServer(("127.0.0.1", port), _Recorder)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        for headers in (None, {"User-Agent": "caller-agent"}, {"user-agent": "lowercase-caller"}):
+            relay_fetch(
+                method="GET",
+                url="http://example.invalid/",
+                headers=headers,
+                relay_url=f"http://127.0.0.1:{port}",
+                relay_token=TOKEN,
+            )
+    finally:
+        server.shutdown()
+
+    check("client sends a User-Agent to the relay", bool(seen) and bool(seen[0]),
+          f"seen={seen}")
+    check("client does not identify as Python-urllib",
+          bool(seen) and "python-urllib" not in seen[0].lower(), f"seen={seen}")
+    check("client uses the configured agent", bool(seen) and seen[0] == RELAY_USER_AGENT,
+          f"seen={seen}, want={RELAY_USER_AGENT}")
+
+    # The agent on the hop to the relay is separate from the one forwarded to
+    # the target. GitHub answers 403 to a request carrying neither.
+    def env_ua(envelope: dict) -> str | None:
+        for key, value in (envelope.get("headers") or {}).items():
+            if key.lower() == "user-agent":
+                return value
+        return None
+
+    check("a default User-Agent is forwarded to the target",
+          len(envelopes) == 3 and env_ua(envelopes[0]) == RELAY_USER_AGENT,
+          f"got {env_ua(envelopes[0]) if envelopes else None!r}")
+    check("a caller-supplied User-Agent wins",
+          len(envelopes) > 1 and env_ua(envelopes[1]) == "caller-agent",
+          f"got {env_ua(envelopes[1]) if len(envelopes) > 1 else None!r}")
+    check("a lowercase caller User-Agent is not overridden",
+          len(envelopes) > 2 and env_ua(envelopes[2]) == "lowercase-caller",
+          f"got {env_ua(envelopes[2]) if len(envelopes) > 2 else None!r}")
+
+
+async def test_http_proxy_client_integration(sshd_port: int) -> None:
+    """Integration test: use http_proxy.py as a subprocess through the relay."""
+    print("\nHTTP proxy client integration (client/http_proxy.py):")
+
+    mock_http_port = alloc_port()
+    mock_server = start_mock_http_server(mock_http_port)
+
+    env = {"WS_PORT": str(alloc_port()), "RATE_LIMIT": "1000"}
+    try:
+        async with Relay("universal.py", env) as relay:
+            http_proxy_script = os.path.join(REPO, "client", "http_proxy.py")
+
+            # Test the client as a subprocess with --raw
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, http_proxy_script,
+                "GET", f"http://127.0.0.1:{mock_http_port}/json",
+                "--raw",
+                env={
+                    **os.environ,
+                    "COWORK_RELAY_URL": f"http://127.0.0.1:{relay.proxy_port}",
+                    "COWORK_RELAY_TOKEN": TOKEN,
+                },
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+                parsed = json.loads(out)
+                check("http_proxy.py CLI GET works",
+                      parsed.get("greeting") == "hello",
+                      f"out={out[:100]}, err={err.decode()[:200]}")
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                check("http_proxy.py CLI GET works", False, "timeout")
+            except Exception as e:
+                check("http_proxy.py CLI GET works", False,
+                      f"{type(e).__name__}: {e}")
+    finally:
+        mock_server.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 async def run() -> bool:
@@ -506,6 +1597,7 @@ async def run() -> bool:
     test_private_detection()
     test_token_comparison()
     test_allowlist_matching()
+    test_env_parsing()
 
     sshd_port, hangup_port = alloc_port(), alloc_port()
     echo_srv = await asyncio.start_server(sshd_echo, "127.0.0.1", sshd_port)
@@ -516,6 +1608,18 @@ async def run() -> bool:
         await test_limits(sshd_port)
         await test_universal(sshd_port)
         await test_ws_proxy_client(sshd_port)
+
+        # HTTP proxy tests
+        test_http_proxy_url_normalization()
+        test_http_proxy_header_stripping()
+        test_http_proxy_client_unit()
+        test_http_proxy_client_useragent()
+        await test_http_proxy(sshd_port)
+        await test_http_proxy_hardening(sshd_port)
+        await test_no_permessage_deflate(sshd_port)
+        await test_upstream_tls_verification()
+        await test_http_proxy_fidelity(sshd_port)
+        await test_http_proxy_client_integration(sshd_port)
     finally:
         echo_srv.close()
         hang_srv.close()

@@ -1,11 +1,19 @@
 # Cloudflare Worker configuration for cowork-tunnel.
 #
-# Setup:
-#   1. npm install -g wrangler
-#   2. wrangler login
-#   3. Copy this file and worker.js to a directory
-#   4. wrangler secret put RELAY_TOKEN
-#   5. wrangler deploy
+# Setup, from this directory:
+#   1. npm install                      # installs the pinned wrangler
+#   2. npx wrangler login
+#   3. npx wrangler secret put RELAY_TOKEN
+#   4. npx wrangler deploy
+#
+# On a headless box, step 2 does not work: `wrangler login` starts an OAuth
+# callback server on localhost that your browser cannot reach. Create an API
+# token with the "Edit Cloudflare Workers" template instead and pass it as
+# CLOUDFLARE_API_TOKEN.
+#
+# Secrets survive a deploy. `wrangler deploy` replaces the script and the
+# [vars] block below; it does not touch RELAY_TOKEN, so step 3 is a one-time
+# action. Check with `npx wrangler secret list` (names only, never values).
 #
 # Generate a token:
 #   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -41,6 +49,15 @@ DEFAULT_PORT = "22"
 # lexical check on the target string and does not resolve DNS, so treat it as a
 # guardrail against typos rather than a security boundary.
 # BLOCK_PRIVATE = "1"
+#
+# --- HTTP proxy ------------------------------------------------------------
+#
+# MAX_RESPONSE_BODY: largest upstream response the /proxy path will return, in
+# bytes. Defaults to 33554432 (32 MiB), matching the self-hosted relay. The
+# body is held three times over while it is base64-encoded, so an uncapped
+# forward of a large download exhausts the isolate's 128 MB and dies with no
+# diagnostic; past the cap the caller gets a 502 naming the limit instead.
+# MAX_RESPONSE_BODY = "33554432"
 
 # Custom domain (optional, requires DNS setup)
 # [[routes]]

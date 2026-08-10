@@ -1,2 +1,9 @@
 # Runtime dependency for the relays and the SSH ProxyCommand client.
-websockets>=12.0
+#
+# 14.1 is the floor the test suite actually verifies: 14.0 and earlier do not
+# expose ClientConnection.close_code, so ws_proxy.py cannot tell the user why
+# the relay refused a tunnel and exits 0 on a rejected token. CI runs the suite
+# against this floor and against the current release.
+#
+# client/http_proxy.py needs nothing beyond the standard library.
+websockets>=14.1

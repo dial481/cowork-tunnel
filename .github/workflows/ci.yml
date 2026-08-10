@@ -28,6 +28,26 @@ jobs:
       - name: Run test suite
         run: python3 tests/test_all.py
 
+  # requirements.txt declares a floor; installing only the newest release would
+  # never prove the floor still works. This job pins it explicitly.
+  websockets-floor:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        websockets-version: ["14.1", "15.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pinned websockets
+        run: |
+          python -m pip install --upgrade pip
+          pip install "websockets==${{ matrix.websockets-version }}"
+      - name: Run test suite
+        run: python3 tests/test_all.py
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -45,3 +65,6 @@ jobs:
       - name: Syntax-check the Cloudflare Worker
         run: node --check worker.js
         working-directory: cloudflare
+
+      - name: Run the Worker test suite
+        run: node tests/test_worker.mjs

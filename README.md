@@ -1,24 +1,24 @@
 # cowork-tunnel
 
-SSH to your own servers from environments whose only outbound path is HTTPS.
+SSH and HTTP proxy for environments whose only outbound path is HTTPS.
 
 ## Why this exists
 
-Anthropic Cowork sessions used to run locally, where SSH worked like it does anywhere else. They moved to cloud-only, and cloud sessions have no outbound path except HTTPS — so `ssh myserver` stopped working, and with it every workflow built on it: deploying, tailing logs, `git push` over SSH, running a build on a bigger box.
+Anthropic Cowork sessions used to run locally, where SSH worked like it does anywhere else. They moved to cloud-only, and cloud sessions have no outbound path except HTTPS — so `ssh myserver` stopped working, and with it every workflow built on it: deploying, tailing logs, `git push` over SSH, running a build on a bigger box. Beyond SSH, the sandbox also intercepts some HTTPS requests — GitHub API calls, Reddit, and other destinations can be unreliable or blocked.
 
-This puts that back. It carries SSH over a WebSocket, which is the one thing an HTTPS-only egress path reliably passes, so you get a normal SSH session to machines you already own.
+This puts that back. Two modes on one deployment:
 
-Nothing here is specific to Cowork. Any environment that permits HTTPS and blocks port 22 — a locked-down CI runner, a corporate proxy, a hotel network — has the same problem and the same fix.
+1. **SSH tunneling** -- carries SSH over a WebSocket, which is the one thing an HTTPS-only egress path reliably passes, so you get a normal SSH session to machines you already own.
+2. **HTTP forwarding** -- forwards arbitrary HTTP requests through the relay, bypassing HTTPS interception for GitHub API, package registries, or any other destination.
+
+Nothing here is specific to Cowork. Any environment that permits HTTPS and blocks port 22 or intercepts HTTPS — a locked-down CI runner, a corporate proxy, a hotel network — has the same problem and the same fix.
 
 ## Scope
 
 Be clear about what this is and isn't:
 
-- It connects to **servers you control**, using **your own SSH keys**.
-- SSH authentication is unchanged and still required end to end. This defeats no authentication anywhere — the far end's sshd is as strict as you configured it.
-- It changes the *transport* SSH travels over. Nothing else.
-
-The relay is a byte pipe. Because SSH encrypts end to end, the relay only ever sees ciphertext — it cannot read or alter your session.
+- **SSH**: It connects to **servers you control**, using **your own SSH keys**. SSH authentication is unchanged and still required end to end. This defeats no authentication anywhere — the far end's sshd is as strict as you configured it. It changes the *transport* SSH travels over. Nothing else. The relay is a byte pipe. Because SSH encrypts end to end, the relay only ever sees ciphertext — it cannot read or alter your session.
+- **HTTP proxy**: It forwards HTTP requests through the relay. The relay sees the plaintext of your requests (URLs, headers, bodies). Use it for API calls that the sandbox blocks, not for passing secrets you wouldn't trust the relay operator with. Upstream credentials (like GitHub PATs) travel in the envelope headers — the relay forwards them but does not store them.
 
 ## Three Options
 
@@ -28,7 +28,7 @@ The relay is a byte pipe. Because SSH encrypts end to end, the relay only ever s
 | **Universal** | One server | Any server from there | Multiple servers, one install |
 | **Cloudflare Worker** | Nothing | Any server | Zero infrastructure, serverless |
 
-All three options use the same client (`client/ws_proxy.py`).
+All three options use the same SSH client (`client/ws_proxy.py`) and the same HTTP proxy client (`client/http_proxy.py`).
 
 ## Security Model — Read This First
 
@@ -97,6 +97,77 @@ The bootstrap script writes a `Host *` block to `~/.ssh/config`, which routes **
 
 Piping a script from the internet into `bash` runs whatever that URL returns. Read it first if that matters to you; it is short.
 
+The script takes three optional overrides:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `COWORK_TUNNEL_DIR` | `/tmp/cowork-tunnel` | Where the client scripts are installed |
+| `COWORK_TUNNEL_REF` | `main` | Branch, tag or commit to fetch the clients from |
+| `COWORK_TUNNEL_REPO_RAW` | GitHub raw URL | A different origin entirely, for a fork or a mirror |
+
+Keep the clients and the relay on the same revision. Installing a client from `main` while running a relay from a branch is how you get behaviour that matches neither.
+
+### HTTP Proxy
+
+The HTTP proxy forwards arbitrary HTTP requests through the relay. It uses the same relay URL and token as the SSH tunnel — one hostname, one token, routed by path. Unlike the SSH client it needs no `websockets` install: it is a plain HTTPS POST and uses only the standard library.
+
+```bash
+# Set relay URL and token (same as SSH)
+export COWORK_RELAY_URL="https://your-relay.example.com"
+export COWORK_RELAY_TOKEN="your-secret-token"
+
+# Simple GET
+python3 client/http_proxy.py GET https://api.github.com/repos/owner/repo
+
+# POST with headers and body
+python3 client/http_proxy.py POST https://api.github.com/repos/owner/repo/issues \
+  -H "Authorization: token ghp_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Bug report"}'
+
+# Pipe output (--raw suppresses status/headers on stderr)
+python3 client/http_proxy.py GET https://example.com/data.json --raw | jq .
+
+# Send a binary body from a file (-b), rather than a string (-d)
+python3 client/http_proxy.py PUT https://example.com/upload -b ./payload.bin
+```
+
+Flags: `-H` adds a header (repeatable), `-d` sends a string body, `-b` sends a file as the body (binary safe), `--raw` prints only the response body so it can be piped.
+
+As a library:
+```python
+from http_proxy import relay_fetch
+
+response = relay_fetch(
+    method="GET",
+    url="https://api.github.com/repos/owner/repo",
+    headers={"Authorization": "token ghp_xxx"},
+)
+print(response["status"])   # 200
+print(response["body"])     # b'{"id": 123, ...}'
+```
+
+The client auto-detects the relay URL format: if `COWORK_RELAY_URL` is a WebSocket URL like `wss://host/ssh?target=...`, it extracts the base host and appends `/proxy`.
+
+The response dict carries `status`, `headers`, `body` (bytes) and `body_b64`. Two fields appear only when relevant:
+
+- `set_cookie` — a list of the target's `Set-Cookie` headers. Cookies are kept out of the flat `headers` dict on purpose: repeated headers are folded together with `, `, and a cookie's `Expires` date contains a comma, so folding them produces values no client can parse.
+- `redirected` / `final_url` — present when the target redirected and the final URL differs from the one you asked for.
+
+Client environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `COWORK_RELAY_URL` | *(required)* | Relay base URL. `wss://`/`ws://` accepted; path and query are stripped |
+| `COWORK_RELAY_TOKEN` | *(empty)* | Bearer token |
+| `COWORK_RELAY_TIMEOUT` | `60` | Seconds to wait for the relay before giving up |
+| `COWORK_RELAY_VERIFY_TLS` | off | Verify the relay's certificate. Off by default because the Cowork sandbox re-signs TLS; turn it on anywhere with a clean path to the relay |
+| `COWORK_RELAY_USER_AGENT` | `cowork-tunnel` | The agent this client identifies as, both to the relay and to the target when you don't set one yourself |
+
+The client reads `COWORK_RELAY_*` from the environment but never modifies it — proxy settings are bypassed per-request rather than by deleting `HTTPS_PROXY` process-wide.
+
+**User-Agent.** Two different requests carry one: the hop to the relay, and the forwarded request the target sees. The client names itself on both. This is not cosmetic — Cloudflare's edge rejects urllib's default `Python-urllib/x.y` with a `403` (error 1010) before the request reaches a Worker-hosted relay at all, and GitHub answers `403` to a forwarded request carrying no agent. Set `User-Agent` in `-H`/`headers` to override what the target sees; the relays forward exactly what the envelope contains and invent nothing.
+
 ### Option 1: Standalone Relay (per server)
 
 Install on the server you want to reach. Bridges WebSocket to local sshd.
@@ -164,14 +235,35 @@ Targets may be `host`, `host:port`, `[v6addr]:port`, or a bare IPv6 literal. The
 | Variable | Default | Meaning |
 |---|---|---|
 | `RELAY_TOKEN` | *(required)* | Bearer token |
-| `WS_HOST` / `WS_PORT` | `127.0.0.1` / `8765` | Listen address |
+| `WS_HOST` | `127.0.0.1` | Listen address for both ports |
+| `WS_PORT` | `8765` | WebSocket/SSH port |
+| `PROXY_PORT` | `8766` | HTTP proxy port, serving `/proxy` and `/health`. Must differ from `WS_PORT` |
 | `MAX_CONNECTIONS` | `10` | Concurrent tunnels |
 | `RATE_LIMIT` | `20` | New connections per minute (shared bucket) |
-| `ALLOWED_HOSTS` | *(empty)* | Hostnames, IPs, or CIDRs. Empty = any target |
-| `BLOCK_PRIVATE` | off | Refuse private/loopback targets |
+| `ALLOWED_HOSTS` | *(empty)* | Hostnames, IPs, or CIDRs. Empty = any target. **SSH path only** |
+| `BLOCK_PRIVATE` | off | Refuse private/loopback targets. **SSH path only** |
 | `DEFAULT_PORT` | `22` | Port used when the target omits one |
 
-`standalone.py` takes the same variables minus the target-related ones, plus `SSH_HOST` / `SSH_PORT` for the local sshd.
+HTTP proxy path (`POST /proxy`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROXY_RATE_LIMIT` | `120` | Proxy requests per minute (separate bucket from `RATE_LIMIT`) |
+| `MAX_PROXY_BODY` | `8 MiB` | Largest request body accepted. This bounds the JSON envelope; a binary payload is base64-encoded inside it, so 8 MiB here is roughly 6 MiB of actual upload. Keep nginx's `client_max_body_size` in step |
+| `MAX_RESPONSE_BODY` | `32 MiB` | Largest upstream response returned. The body is buffered and base64-encoded, so relay memory peaks at roughly 2.5× this |
+| `PROXY_TIMEOUT` | `25` | Seconds to wait for the upstream target |
+| `HEAD_TIMEOUT` / `BODY_TIMEOUT` | `15` / `30` | Seconds a client may take to send a request head / body before the connection is dropped |
+| `INSECURE_UPSTREAM_TLS` | off | Skip certificate verification on upstream HTTPS. **Off by default** — only enable if the relay itself sits behind a TLS-intercepting gateway |
+
+`standalone.py` takes the same variables minus the target-related ones, plus `SSH_HOST` / `SSH_PORT` for the local sshd. It is SSH-only and has no `/proxy` endpoint.
+
+**Upstream TLS is verified.** The relay checks the target's certificate against the system trust store. The *client* skips verification when talking to the relay (the Cowork sandbox re-signs everything), but the relay's own hop to the internet is verified — that hop is what carries your forwarded credentials. `INSECURE_UPSTREAM_TLS=1` turns it off if your relay genuinely sits behind an intercepting proxy.
+
+**`ALLOWED_HOSTS` and `BLOCK_PRIVATE` do not apply to `/proxy`.** They are TCP target controls for the SSH path. The HTTP proxy forwards to any `http(s)` URL by design. Other schemes (`file:`, `ftp:`, `data:`) are refused — without that, a token holder could read files off the relay's own disk.
+
+**Two local ports, one public endpoint.** The universal relay listens twice: `WS_PORT` (default 8765) for WebSocket/SSH, and `PROXY_PORT` (default 8766) for `/proxy` and `/health`. Both are plaintext and both expect to sit behind nginx, which terminates TLS on 443 and routes by path. **Clients only ever reach 443** — the split is invisible to them, and neither port should be exposed directly.
+
+If you upgrade an existing install, add the `/proxy` and `/health` location blocks pointing at 8766 and set `PROXY_PORT` in the unit's env file. Sending `/proxy` to 8765 gets a `426` from websockets. See [Design notes](#design-notes-why-the-relay-listens-twice) for why it is built this way.
 
 ### Option 3: Cloudflare Worker (serverless)
 
@@ -198,17 +290,24 @@ ssh -o 'ProxyCommand=python3 client/ws_proxy.py' user@server
 
 The Worker has no rate limit and no connection cap — Workers gives you no shared state to implement them in without a Durable Object. If that matters for your deployment, set `ALLOWED_HOSTS` and treat the token as the whole security model.
 
+The Worker caps proxied response bodies at 32 MiB, matching the relay's `MAX_RESPONSE_BODY`. Override it with a `MAX_RESPONSE_BODY` var in `wrangler.toml`. The cap exists because the response is held three times over while it is base64-encoded — the buffer, the binary string, and the output — so an uncapped forward of a large download walks the isolate into its 128 MB memory limit and dies with nothing the caller can read. Past the cap you get a `502` naming the limit instead.
+
+Proxied requests are logged as `[proxy] METHOD host -> status`, visible in `wrangler tail`. Host only, never the full URL: a forwarded URL can carry a token in its query string.
+
 ## Architecture
 
 ```
-Standalone:
-  restricted env --> WSS/443 --> nginx --> relay (localhost:8765) --> sshd (localhost:22)
+The client only ever reaches port 443. nginx terminates TLS and routes by path;
+the universal relay's two local ports are never exposed.
 
-Universal:
-  restricted env --> WSS/443 --> nginx --> relay (localhost:8765) --> TCP --> any-server:22
+SSH Tunnel:
+  Standalone:   restricted env --> WSS/443 --> nginx --> :8765 relay --> sshd (localhost:22)
+  Universal:    restricted env --> WSS/443 --> nginx --> :8765 relay --> TCP --> any-server:22
+  Cloudflare:   restricted env --> WSS/443 --> CF Edge --> Worker --> TCP --> any-server:22
 
-Cloudflare:
-  restricted env --> WSS/443 --> CF Edge --> Worker --> TCP --> any-server:22
+HTTP Proxy:
+  Universal:    restricted env --> POST /proxy --> nginx --> :8766 relay --> any URL
+  Cloudflare:   restricted env --> POST /proxy --> CF Edge --> Worker --> fetch() --> any URL
 ```
 
 ## SSH Config Integration
@@ -243,7 +342,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
 
-    # Universal relay
+    # Universal relay -- SSH over WebSocket
     location /ssh {
         proxy_pass http://127.0.0.1:8765;
         proxy_http_version 1.1;
@@ -251,21 +350,43 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         access_log off;              # the token is in the query string
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+        # SSH sessions idle. Anything short and nginx closes the tunnel under you.
+        proxy_read_timeout 7d;
+        proxy_send_timeout 7d;
         proxy_buffering off;
     }
 
-    # Standalone relay, if you run both on one host
-    location /ssh-standalone {
+    # Universal relay -- HTTP proxy (note the different port)
+    location /proxy {
         proxy_pass http://127.0.0.1:8766;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        access_log off;
+        proxy_read_timeout 30s;
+        proxy_send_timeout 30s;
+        client_max_body_size 8m;
+    }
+
+    # Health check, same port as the HTTP proxy. Optional.
+    location /health {
+        proxy_pass http://127.0.0.1:8766;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        access_log off;
+    }
+
+    # Standalone relay, if you run both on one host. Note 8767: the universal
+    # relay already occupies 8765 (SSH) and 8766 (HTTP proxy).
+    location /ssh-standalone {
+        proxy_pass http://127.0.0.1:8767;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         access_log off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+        proxy_read_timeout 7d;
+        proxy_send_timeout 7d;
         proxy_buffering off;
     }
 }
@@ -313,9 +434,14 @@ sudo install -m 644 relay/cowork-tunnel@.service /etc/systemd/system/
 # root before dropping to User=nobody, so the relay account never needs them.
 sudo install -d -m 700 /etc/cowork-tunnel
 TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-printf 'RELAY_TOKEN=%s\nWS_PORT=8765\n' "$TOKEN" | sudo tee /etc/cowork-tunnel/universal.env  >/dev/null
-printf 'RELAY_TOKEN=%s\nWS_PORT=8766\n' "$TOKEN" | sudo tee /etc/cowork-tunnel/standalone.env >/dev/null
-sudo chmod 600 /etc/cowork-tunnel/*.env
+# The universal relay binds two ports (8765 SSH, 8766 HTTP proxy), so the
+# standalone relay goes on 8767 rather than colliding with 8766.
+printf 'RELAY_TOKEN=%s\nWS_PORT=8765\nPROXY_PORT=8766\n' "$TOKEN" | sudo tee /etc/cowork-tunnel/universal.env  >/dev/null
+printf 'RELAY_TOKEN=%s\nWS_PORT=8767\n' "$TOKEN" | sudo tee /etc/cowork-tunnel/standalone.env >/dev/null
+# Explicit paths, not a glob: /etc/cowork-tunnel is 0700 root-owned, so a glob
+# expands in your unprivileged shell, fails, and the chmod silently never runs --
+# leaving the token files world-readable.
+sudo chmod 600 /etc/cowork-tunnel/universal.env /etc/cowork-tunnel/standalone.env
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now cowork-tunnel@universal
@@ -334,6 +460,8 @@ Check them with `systemctl status cowork-tunnel@universal` and `journalctl -u co
 
 **"externally-managed-environment" on pip install:** Modern Debian/Ubuntu blocks system-wide pip. Use `pip install websockets --break-system-packages`.
 
+**Certbot times out, or the relay is unreachable even though `ufw` allows the port:** Your host firewall is not the only one. Cloud providers put a second firewall in front of the instance — DigitalOcean Cloud Firewalls, AWS security groups, GCP VPC rules — and it is invisible to `ufw status`. A *closed* port refuses instantly; a *filtered* one times out, so a timeout is the tell. Confirm at the packet level rather than guessing: run `sudo tcpdump -n -i any 'tcp port 443 and tcp[tcpflags] & tcp-syn != 0'`, then connect from somewhere off-box. No inbound SYN means the packets never arrived and the provider firewall is dropping them; open the port there too.
+
 **Self-signed cert rejected (503 with TLS_error):** The egress proxy validates your relay's certificate. Use a real cert — see the sslip.io trick in the setup section above.
 
 **Connection reset by peer during TLS:** An explicit `HTTPS_PROXY` in the environment interferes. The client clears it automatically; if you're using a custom client, unset `HTTPS_PROXY` before connecting.
@@ -349,10 +477,15 @@ Check them with `systemctl status cowork-tunnel@universal` and `journalctl -u co
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python3 tests/test_all.py        # add -v for per-check detail
+python3 tests/test_all.py        # relays and clients; add -v for per-check detail
+node tests/test_worker.mjs       # Cloudflare Worker; needs Node 18+
 ```
 
 The suite imports the relay scripts for unit tests and spawns them as real subprocesses for integration tests, so it covers the code that actually ships. It runs fully offline — every target is a loopback address or an IP literal. CI runs it on Python 3.10–3.12, plus `shellcheck` on the bootstrap script and a syntax check on the Worker.
+
+The Worker is tested too, despite having no local runtime. `tests/test_worker.mjs` loads the real `cloudflare/worker.js` with its one `cloudflare:sockets` import redirected to a stub, then calls the exported `fetch` handler directly — Node supplies the rest of what the proxy path uses (`fetch`, `Request`, `Response`, `Headers`, `atob`/`btoa`) from the same web-standard implementations Workers exposes. That covers routing, auth, forwarding, response fidelity and malformed input. The SSH bridge still needs real TCP sockets and a real `WebSocketPair`, so it remains reviewed by hand.
+
+`websockets>=14.1` is the declared floor and CI pins that exact version in a separate job. Installing only the newest release would never prove the floor still works — and it did not: 14.0 and earlier lack `ClientConnection.close_code`, which `ws_proxy.py` needs to tell you *why* a tunnel was refused.
 
 ## Design notes: why WebSocket, and why the setup looks like this
 
@@ -365,6 +498,37 @@ Two constraints drove the whole design. Neither is exotic — most HTTPS-only en
 There is also often an explicit `HTTPS_PROXY` in the environment. The `websockets` library doesn't speak `CONNECT`, so `ws_proxy.py` clears those variables and connects directly.
 
 **What that costs you.** Since the client can't verify the relay's certificate, someone positioned between the two could read the bearer token in transit. Your SSH session is unaffected — it's encrypted end to end and host key verification still applies, so the tunnel operator and any observer see only ciphertext. The token is the exposed item, which is why it's worth rotating if you suspect it leaked.
+
+## Design notes: why the relay listens twice
+
+Adding `POST /proxy` raised a question that looks trivial and isn't: how does one process serve both WebSocket upgrades and ordinary HTTP requests? The `websockets` library expects to own a listening socket and offers no public way to hand it a connection you have already accepted — `serve()` takes a *listening* socket, never a connected one. Nor can its `process_request` hook answer `/proxy`, because that hook never sees a request body.
+
+Three designs were tried. The relay uses the third.
+
+**1. Swap the protocol in-process.** Read the request head yourself, build a `ServerConnection` by hand, and attach it to the existing transport with `set_protocol()`. One socket, no copying.
+
+It needs `ServerProtocol`'s constructor, `ServerConnection`'s constructor, the `Server` object it expects, and the way the handshake task is started — none of it public API. The first version of the v2 proxy was built this way. It worked on websockets 17.x and **broke the SSH bridge on 13.1, 14.2, 15.0 and 16.0**: four of the five versions tested. The failure mode is the bad kind — silent, total, and triggered by an unrelated `pip install -U`.
+
+**2. Dispatch in front of a loopback websockets server.** Read the head on the public port, answer `/proxy` yourself, and for an upgrade open a second connection to a websockets server on `127.0.0.1`, replay the head, and copy bytes both ways. Public API only, one public port — but it puts a hand-written HTTP parser in front of every tunnel and copies every byte an extra time.
+
+**3. Give each protocol its own local port.** *(chosen)* `websockets` owns `WS_PORT` outright, exactly as it did before the proxy existed, so nothing sits between a client and the library's own handshake. The HTTP handlers own `PROXY_PORT` and never see tunnel traffic. nginx routes by path, so clients still reach exactly one endpoint on 443.
+
+This is the least code and the least cleverness: no internals, no interposed parser, and the SSH path is byte-for-byte the arrangement that shipped in v1.0.0. The cost is one more port to configure, which is why the `/proxy` and `/health` location blocks point at 8766.
+
+### The thing that actually made it fast
+
+All three designs measure the same — roughly 175–240 MiB/s over loopback for 100 MiB of random data. The architecture was never the bottleneck.
+
+What *was* the bottleneck: `serve()` and `connect()` negotiate **permessage-deflate** by default, and this tunnel carries SSH. SSH is encrypted, so its bytes are indistinguishable from random and cannot compress. Every frame was being run through deflate to produce slightly *larger* output, on both ends.
+
+| 100 MiB of random data, end to end | throughput |
+|---|---|
+| permessage-deflate enabled (as shipped in v1.0.0) | **12.5 MiB/s** |
+| `compression=None` | **220 MiB/s** |
+
+That is a ~17× throughput bug that was present in v1.0.0 and had nothing to do with the proxy work. It is now disabled in `universal.py`, `standalone.py`, and `ws_proxy.py` — the client declines it too, which also covers the Cloudflare path, where the edge would otherwise accept the offer. A test asserts the handshake response carries no `Sec-WebSocket-Extensions` header, so it cannot come back unnoticed.
+
+An earlier draft of these notes blamed design 2 for a 4× slowdown. That was wrong: the measurement compared a compressed build against an uncompressed one, using a payload of repeated bytes that deflate handled unrealistically well. Real SSH traffic does not look like that.
 
 ## License
 
