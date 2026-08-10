@@ -1,0 +1,51 @@
+[build-system]
+# 77 is the floor for PEP 639: the SPDX license string below is not
+# understood by older setuptools, which would silently produce metadata
+# without a license.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cowork-tunnel"
+version = "2.1.0"
+description = "SSH and HTTP proxy for environments whose only outbound path is HTTPS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "dial481" }]
+keywords = ["ssh", "tunnel", "websocket", "proxy", "cloudflare"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: System :: Networking",
+]
+
+# websockets is required by the SSH client only; http_proxy.py is standard
+# library alone. It is a hard dependency rather than an extra so that
+# `pip install cowork-tunnel` yields two working commands rather than one
+# working command and one that fails on first use.
+dependencies = ["websockets>=14.1"]
+
+[project.urls]
+Homepage = "https://github.com/dial481/cowork-tunnel"
+Source = "https://github.com/dial481/cowork-tunnel"
+Issues = "https://github.com/dial481/cowork-tunnel/issues"
+
+[project.scripts]
+cowork-tunnel-ssh = "cowork_tunnel.ws_proxy:main"
+cowork-tunnel-http = "cowork_tunnel.http_proxy:main"
+
+# The clients ship as the package; the relays are server-side files you copy to
+# a host, and packaging them would imply an install path they do not have.
+[tool.setuptools]
+packages = ["cowork_tunnel"]
+
+[tool.setuptools.package-dir]
+cowork_tunnel = "client"

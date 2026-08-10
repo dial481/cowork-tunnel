@@ -96,6 +96,18 @@ def _clear_proxy_env():
         os.environ.pop(key, None)
 
 
+def _prog() -> str:
+    """How this was invoked, for messages that tell the user what to run.
+
+    Installed as a console script it is "cowork-tunnel-ssh"; run as a file it is
+    "python3 ws_proxy.py". Hardcoding either one makes the advice wrong in the
+    other case, and this is a ProxyCommand -- the message is the only thing the
+    user sees when it is misconfigured.
+    """
+    name = os.path.basename(sys.argv[0] or "ws_proxy.py")
+    return name if name.startswith("cowork-tunnel") else f"python3 {name}"
+
+
 def _get_config() -> tuple[str, str]:
     if len(sys.argv) >= 3:
         return sys.argv[1], sys.argv[2]
@@ -103,7 +115,7 @@ def _get_config() -> tuple[str, str]:
     token = os.environ.get("COWORK_RELAY_TOKEN", "")
     if not url:
         print(
-            "Usage: python3 ws_proxy.py <url> <token>\n"
+            f"Usage: {_prog()} <url> <token>\n"
             "   or: set COWORK_RELAY_URL and COWORK_RELAY_TOKEN env vars.\n\n"
             "URL examples:\n"
             "  Standalone:  wss://server.com/ssh\n"
@@ -128,7 +140,7 @@ async def _run_tunnel(ws) -> None:
     except (ValueError, OSError) as e:
         raise RuntimeError(
             "stdin/stdout are not pipes. ws_proxy.py is an SSH ProxyCommand -- "
-            "run it as ssh -o 'ProxyCommand=python3 ws_proxy.py' rather than directly."
+            f"run it as ssh -o 'ProxyCommand={_prog()}' rather than directly."
         ) from e
 
     async def stdin_to_ws() -> None:
@@ -250,8 +262,18 @@ async def proxy() -> None:
         sys.exit(1)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point.
+
+    A console script needs a named callable, so the asyncio.run() that used to
+    sit under __main__ lives here and __main__ defers to it. Behaviour when the
+    file is run directly is unchanged.
+    """
     try:
         asyncio.run(proxy())
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    main()

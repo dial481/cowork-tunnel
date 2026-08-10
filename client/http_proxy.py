@@ -264,7 +264,10 @@ def relay_fetch(
 # ---------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="http_proxy",
+        # No prog=: argparse derives it from argv[0], so this reads
+        # "cowork-tunnel-http" when installed and "http_proxy.py" when the file
+        # is run directly. Both are true; a hardcoded name is only ever right
+        # for one of them.
         description="Forward HTTP requests through a cowork-tunnel relay.",
     )
     parser.add_argument("method", metavar="METHOD", help="HTTP method (GET, POST, ...)")

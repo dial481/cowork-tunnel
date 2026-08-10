@@ -68,6 +68,22 @@ Entries in `ALLOWED_HOSTS` are treated as a deliberate decision and override `BL
 
 ### Client (in the restricted environment)
 
+If pip works where you are, this is the short path:
+
+```bash
+pip install cowork-tunnel
+
+export COWORK_RELAY_URL="wss://your-relay.example.com/ssh"
+export COWORK_RELAY_TOKEN="your-secret-token"
+
+cowork-tunnel-http GET https://api.github.com/zen --raw
+ssh -o 'ProxyCommand=cowork-tunnel-ssh' user@server
+```
+
+The package installs two commands and pulls in `websockets` for you. The rest of
+this section is the fallback for environments where pip is blocked — the clients
+are standalone files by design and `bootstrap.sh` fetches them individually.
+
 ```bash
 # Install deps (one time per session)
 apt-get install -y openssh-client
@@ -137,9 +153,9 @@ python3 client/http_proxy.py PUT https://example.com/upload -b ./payload.bin
 
 Flags: `-H` adds a header (repeatable), `-d` sends a string body, `-b` sends a file as the body (binary safe), `--raw` prints only the response body so it can be piped.
 
-As a library:
+As a library (`from cowork_tunnel.http_proxy import ...` when pip-installed, `from http_proxy import ...` when using the file directly):
 ```python
-from http_proxy import relay_fetch
+from cowork_tunnel.http_proxy import relay_fetch
 
 response = relay_fetch(
     method="GET",

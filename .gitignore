@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+dist/
+build/
+*.egg-info/
 .wrangler/
 
 # Secrets and credentials -- never commit these
