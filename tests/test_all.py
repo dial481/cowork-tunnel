@@ -530,6 +530,48 @@ async def test_ws_proxy_client(sshd_port: int) -> None:
             await proc.wait()
             check("bad token handled cleanly", False, "client hung instead of exiting")
 
+    # The Cloudflare Worker refuses before the upgrade with an HTTP status and a
+    # text body: 403 "Forbidden" for a bad token, 403 with a reason for a target
+    # outside ALLOWED_HOSTS or blocked by BLOCK_PRIVATE, 400 for a bad target.
+    # The client must pass the reason on rather than blaming the token.
+    cases = [
+        (403, b"Forbidden", "relay rejected the token", "403 Forbidden is reported as a rejected token"),
+        (403, b"Target not in allowlist", "relay refused the request: Target not in allowlist",
+         "403 for a refused target shows the relay's reason, not 'token'"),
+        (403, b"Private/loopback addresses not allowed",
+         "relay refused the request: Private/loopback addresses not allowed",
+         "403 from BLOCK_PRIVATE shows the relay's reason"),
+        (400, b"Invalid target", "relay refused the request: Invalid target", "400 shows the relay's reason"),
+        (403, b"bad\x1b[31m\xe2\x80\xaeevil", "relay refused the request: bad [31m evil",
+         "control and bidi characters in the reason are blanked"),
+    ]
+    for status, body, expected, label in cases:
+        async def refuse(reader, writer, status=status, body=body):
+            await reader.readuntil(b"\r\n\r\n")
+            reason = "Forbidden" if status == 403 else "Bad Request"
+            writer.write(f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\n"
+                         f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+            await writer.drain()
+            writer.close()
+        server = await asyncio.start_server(refuse, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, CLIENT, f"ws://127.0.0.1:{port}/?target=example.com:22", TOKEN,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+            text = err.decode(errors="replace").strip()
+            check(label, proc.returncode != 0 and out == b"" and expected in text, text[:160])
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            check(label, False, "client hung instead of exiting")
+        finally:
+            server.close()
+            await server.wait_closed()
+
 
 # ---------------------------------------------------------------------------
 # Mock HTTP server for proxy tests

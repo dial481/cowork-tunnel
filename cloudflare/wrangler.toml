@@ -1,7 +1,7 @@
 # Cloudflare Worker configuration for cowork-tunnel.
 #
 # Setup, from this directory:
-#   1. npm install                      # installs the pinned wrangler
+#   1. npm install                      # installs the pinned wrangler (4.x, needs Node 22+)
 #   2. npx wrangler login
 #   3. npx wrangler secret put RELAY_TOKEN
 #   4. npx wrangler deploy

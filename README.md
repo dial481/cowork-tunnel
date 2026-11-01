@@ -506,6 +506,8 @@ Check them with `systemctl status cowork-tunnel@universal` and `journalctl -u co
 
 **`Error: relay rejected the token`:** The token the client sent doesn't match `RELAY_TOKEN` on the relay. Note that the relay accepts the WebSocket upgrade and *then* closes it with code 4003, so this shows up as a rejection after connect, not a failed connect.
 
+**`Error: relay refused the request: ...`:** The relay turned the request down before connecting and said why; the text after the colon is its reason. From the Cloudflare Worker that is `Target not in allowlist` (add the host to `ALLOWED_HOSTS`), a `BLOCK_PRIVATE` refusal (a private address, or an address not written in standard form, with the form to use), or `Invalid target` / `Missing target parameter` (check `?target=host:port`). Clients before 2.1.2 reported all of these as a rejected token.
+
 **`Error: target host not allowed by the relay`:** `ALLOWED_HOSTS` is set and your target isn't in it, or `BLOCK_PRIVATE` is on and the target resolves to a private address. Add the host to `ALLOWED_HOSTS` — an explicit entry overrides `BLOCK_PRIVATE`.
 
 ## Testing

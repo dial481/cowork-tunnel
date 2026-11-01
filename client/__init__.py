@@ -5,4 +5,4 @@ individually, which is the fallback for environments where pip is unavailable.
 Nothing here may import anything outside the standard library except websockets.
 """
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"

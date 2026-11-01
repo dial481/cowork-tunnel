@@ -183,6 +183,15 @@ _STATUS_MESSAGES = {
 }
 
 
+def _response_text(e: Exception) -> str:
+    """The body of a refused upgrade, as one short printable line, or ""."""
+    body = getattr(getattr(e, "response", None), "body", None)
+    if not isinstance(body, (bytes, bytearray)) or not body:
+        return ""
+    text = body[:300].decode("utf-8", "replace")
+    return "".join(ch if ch.isprintable() else " " for ch in text).strip()
+
+
 def _report_error(e: Exception, url: str) -> None:
     """Translate a connection failure into a human-readable stderr message."""
     if isinstance(e, ConnectionRefusedError):
@@ -197,7 +206,15 @@ def _report_error(e: Exception, url: str) -> None:
     if code is None:
         code = getattr(e, "code", None)
 
-    if code in _STATUS_MESSAGES:
+    # The relay answers 403 both for a bad token ("Forbidden") and for a target
+    # it will not reach (ALLOWED_HOSTS, BLOCK_PRIVATE), and 400 for a bad
+    # target; only the response body tells them apart. Show the relay's own
+    # reason when it gave one, so a refused target is not reported as a
+    # rejected token.
+    detail = _response_text(e)
+    if code in (400, 403) and detail and detail.lower() not in ("forbidden", "bad request"):
+        print(f"Error: relay refused the request: {detail}", file=sys.stderr)
+    elif code in _STATUS_MESSAGES:
         print(f"Error: {_STATUS_MESSAGES[code]}", file=sys.stderr)
     elif code is not None:
         print(f"Error: relay returned status {code}", file=sys.stderr)
