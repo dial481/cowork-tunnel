@@ -145,16 +145,22 @@ export default {
 
     // Optional private-address guard, off by default.
     const blockPrivate = /^(1|true|yes|on)$/i.test(env.BLOCK_PRIVATE || "");
-    if (blockPrivate && !allowlisted && isPrivateOrLoopback(targetHost)) {
-      return new Response("Private/loopback addresses not allowed", {
-        status: 403,
-      });
+    const blockedReason = blockPrivate && !allowlisted ? blockedTargetReason(targetHost) : null;
+    if (blockedReason) {
+      return new Response(blockedReason, { status: 403 });
     }
 
     // Create the WebSocket pair and accept before any await, so no inbound
     // message can be dropped between accept() and listener registration.
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
+    // Recent compatibility dates follow the WebSocket spec and deliver binary
+    // frames as Blob by default. The bridge reads them synchronously as
+    // ArrayBuffer (an async Blob read could reorder frames), and
+    // `new Uint8Array(blob)` is silently empty, which loses every byte the
+    // client sends. Ask for ArrayBuffer explicitly so the bridge keeps
+    // working when compatibility_date is bumped.
+    server.binaryType = "arraybuffer";
 
     bridge(server, targetHost, targetPort);
 
@@ -465,6 +471,16 @@ function bridge(server, targetHost, targetPort) {
     (e) => teardown(1011, `Cannot connect to ${target}: ${e.message}`)
   );
 
+  // Target -> client has no backpressure here: a Workers WebSocket has no
+  // bufferedAmount and send() never waits, so frames the client has not
+  // taken yet queue in the Worker (measured in workerd: 400 MB sent to a
+  // stalled reader raised memory by about 430 MB). For ssh, scp, sftp and
+  // rsync that queue stays small, because the target only sends as much as
+  // the client's SSH channel window allows (measured: a 300 MB scp download
+  // throttled to 5 MB/s used no more memory than an unthrottled one). A
+  // protocol without its own flow control, tunnelled to a slow client, can
+  // grow it without limit; fixing that needs acknowledgements from the
+  // client, which the existing clients do not send.
   async function readLoop() {
     const reader = tcp.readable.getReader();
     try {
@@ -597,30 +613,113 @@ function isAllowlisted(host, allowedHosts) {
  * (a Worker's egress cannot reach your LAN, and there is no instance metadata
  * service at 169.254.169.254), and Workers has no resolver API to close it
  * with. Defense in depth, not a security boundary.
+ *
+ * The target is put into canonical form first (WHATWG URL host parsing), so
+ * other spellings of the same address are caught too: 127.1, 2130706433,
+ * 0x7f000001 and 0177.0.0.1 all become 127.0.0.1, and IPv6 literals are
+ * compressed, e.g. [0:0:0:0:0:0:0:1] becomes [::1].
  */
 function isPrivateOrLoopback(host) {
-  const value = host.toLowerCase();
+  return blockedTargetReason(host) !== null;
+}
+
+/**
+ * Why BLOCK_PRIVATE refuses this target, or null if it does not. The reason
+ * is sent back to the client, so it says what to change.
+ */
+function blockedTargetReason(host) {
+  const typed = String(host).toLowerCase().replace(/^\[|\]$/g, "");
+  const value = canonicalHost(host);
+  const PRIVATE = "Private/loopback addresses not allowed";
 
   if (
     value === "localhost" ||
     value === "localhost.localdomain" ||
+    value.endsWith(".localhost") ||
     value.endsWith(".local") ||
     value.endsWith(".internal")
   ) {
-    return true;
+    return PRIVATE;
   }
 
-  if (value.includes(":")) {
-    const stripped = value.replace(/^\[|\]$/g, "");
-    if (stripped === "::1" || stripped === "::") return true;
-    if (stripped.startsWith("fe80:")) return true; // link-local
-    if (/^f[cd]/.test(stripped)) return true; // unique local
-    const v4mapped = stripped.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (v4mapped) return isPrivateIPv4(v4mapped[1]);
-    return false;
+  // An IP literal written in a non-standard way (127.1, 0x7f000001, leading
+  // zeros, a trailing dot, an IPv6 form the parser rejects) is refused
+  // outright. Different parsers disagree on what such strings mean -- 0127.0.0.1
+  // is 87.0.0.1 to a URL parser but may be 127.0.0.1 to another -- so the only
+  // safe answer is not to guess, and not to suggest an IPv4 rewrite either.
+  const ipLike = typed.includes(":") || /^[0-9a-fx.]+$/.test(typed);
+  if (ipLike && value !== typed && value !== `[${typed}]`) {
+    if (!value.startsWith("[")) {
+      return typed.includes(":")
+        ? "Target address is not a valid IPv6 address"
+        : "Target address is not in standard form; write IPv4 as four decimal numbers without leading zeros";
+    }
+    // An IPv4-mapped address (::ffff:8.8.8.8) is better written as the plain
+    // IPv4 address than as the hex form the URL parser prints.
+    const g = ipv6Groups(value.slice(1, -1));
+    if (g && g.slice(0, 5).every((n) => n === 0) && g[5] === 0xffff) {
+      return `Target address is not in standard form; write it as ${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+    }
+    return `Target address is not in standard form; write it as ${value}`;
   }
 
-  return isPrivateIPv4(value);
+  if (value.startsWith("[")) {
+    const g = ipv6Groups(value.slice(1, -1));
+    if (!g) return "Target address is not in standard form";
+    const zero = (from, to) => g.slice(from, to).every((n) => n === 0);
+    if (zero(0, 7) && g[7] <= 1) return PRIVATE; // :: and ::1
+    if ((g[0] & 0xffc0) === 0xfe80) return PRIVATE; // link-local fe80::/10
+    if ((g[0] & 0xffc0) === 0xfec0) return PRIVATE; // site-local fec0::/10
+    if ((g[0] & 0xfe00) === 0xfc00) return PRIVATE; // unique local fc00::/7
+    if ((g[0] & 0xff00) === 0xff00) return PRIVATE; // multicast ff00::/8
+    if (g[0] === 0x2002) return PRIVATE; // 6to4 2002::/16 (embeds an IPv4 address)
+    if (g[0] === 0x2001 && g[1] < 0x200) return PRIVATE; // IETF protocol assignments 2001::/23, incl. Teredo 2001::/32
+    if (g[0] === 0x2001 && g[1] === 0x0db8) return PRIVATE; // documentation 2001:db8::/32
+    if (g[0] === 0x0100 && zero(1, 4)) return PRIVATE; // discard-only 100::/64
+    if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return PRIVATE; // local-use NAT64 64:ff9b:1::/48
+    // IPv4 carried inside IPv6: v4-mapped (::ffff:a.b.c.d), v4-translated
+    // (::ffff:0:a.b.c.d), the deprecated v4-compatible form (::a.b.c.d) and
+    // NAT64 (64:ff9b::a.b.c.d).
+    const embedded =
+      (zero(0, 5) && g[5] === 0xffff) ||
+      (zero(0, 4) && g[4] === 0xffff && g[5] === 0) ||
+      zero(0, 6) ||
+      (g[0] === 0x64 && g[1] === 0xff9b && zero(2, 6));
+    if (embedded) {
+      const v4 = `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+      return isPrivateIPv4(v4) ? PRIVATE : null;
+    }
+    return null;
+  }
+
+  return isPrivateIPv4(value) ? PRIVATE : null;
+}
+
+/**
+ * Canonical, lower-case form of a target host as a URL parser sees it.
+ * IPv6 literals come back in brackets. Returns "" if it does not parse.
+ */
+function canonicalHost(host) {
+  const h = String(host).toLowerCase().replace(/^\[|\]$/g, "");
+  const literal = h.includes(":") ? `[${h}]` : h;
+  try {
+    return new URL(`http://${literal}/`).hostname;
+  } catch {
+    return "";
+  }
+}
+
+/** The eight 16-bit groups of a canonical (URL-serialized) IPv6 address, or null. */
+function ipv6Groups(v6) {
+  const halves = v6.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return null;
+  const parts = [...head, ...Array(fill).fill("0"), ...tail];
+  if (parts.length !== 8 || !parts.every((p) => /^[0-9a-f]{1,4}$/.test(p))) return null;
+  return parts.map((p) => parseInt(p, 16));
 }
 
 function isPrivateIPv4(host) {
@@ -628,7 +727,7 @@ function isPrivateIPv4(host) {
   if (parts.length !== 4 || !parts.every((p) => /^\d{1,3}$/.test(p))) {
     return false;
   }
-  const [a, b] = parts.map((p) => parseInt(p, 10));
+  const [a, b, c] = parts.map((p) => parseInt(p, 10));
   if (parts.some((p) => parseInt(p, 10) > 255)) return false;
 
   if (a === 0) return true; // 0.0.0.0/8
@@ -637,9 +736,11 @@ function isPrivateIPv4(host) {
   if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
   if (a === 169 && b === 254) return true; // link-local
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
-  if (a === 192 && b === 0) return true; // 192.0.0.0/24 + TEST-NET-1
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24, TEST-NET-1
   if (a === 192 && b === 168) return true; // 192.168.0.0/16
   if (a === 198 && b >= 18 && b <= 19) return true; // benchmarking
+  if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
   if (a >= 224) return true; // multicast + reserved + broadcast
   return false;
 }

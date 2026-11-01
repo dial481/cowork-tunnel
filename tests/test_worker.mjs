@@ -592,6 +592,86 @@ async function main() {
       watched.close();
     }
 
+
+    console.log("\nTunnel target policy (BLOCK_PRIVATE) and binaryType:");
+    const ORIGIN = "https://relay.example.com";
+    const upgrade = (query, { env = ENV } = {}) =>
+      worker.fetch(new Request(`${ORIGIN}/${query}`, { headers: { Upgrade: "websocket" } }), env);
+    res = await upgrade(`?token=${TOKEN}&target=10.0.0.5:22`, { env: { ...ENV, BLOCK_PRIVATE: "1" } });
+    check("BLOCK_PRIVATE refuses a private target", res.status === 403, `got ${res.status}`);
+    for (const t of ["127.1:22", "2130706433:22", "0x7f000001:22", "0177.0.0.1:22", "[0:0:0:0:0:0:0:1]:22",
+                     "[::ffff:7f00:1]:22", "[::ffff:10.1.2.3]:22", "[64:ff9b::a00:1]:22", "[febf::1]:22", "[fe80::1]:22",
+                     "0127.0.0.1:22", "010.0.0.1:22", "[::ffff:127.1]:22", "[::ffff:0177.0.0.1]:22", "[::1.]:22",
+                     "[::ffff:0:7f00:1]:22", "[2002:a00:1::1]:22", "[64:ff9b:1::1]:22", "[fec0::1]:22", "[ff02::1]:22",
+                     "foo.localhost:22", "192.0.2.1:22", "[2001:0:4136:e378:8000:63bf:3fff:fdd2]:22", "[2001::1]:22"]) {
+      let status;
+      try {
+        status = (await upgrade(`?token=${TOKEN}&target=${encodeURIComponent(t)}`, { env: { ...ENV, BLOCK_PRIVATE: "1" } })).status;
+      } catch (e) {
+        status = /WebSocketPair/.test(String(e)) ? "let through" : String(e);
+      }
+      check(`BLOCK_PRIVATE refuses another spelling: ${t}`, status === 403, `got ${status}`);
+    }
+    for (const t of ["198.51.100.7:22", "203.0.113.9:22", "[2001:db8::1]:22", "[100::1]:22", "[100::0:0:0:1]:22"]) {
+      let status;
+      try {
+        status = (await upgrade(`?token=${TOKEN}&target=${encodeURIComponent(t)}`, { env: { ...ENV, BLOCK_PRIVATE: "1" } })).status;
+      } catch (e) {
+        status = /WebSocketPair/.test(String(e)) ? "let through" : String(e);
+      }
+      check(`BLOCK_PRIVATE refuses a documentation/discard range: ${t}`, status === 403, `got ${status}`);
+    }
+    const reasonFor = async (t) => {
+      const r = await upgrade(`?token=${TOKEN}&target=${encodeURIComponent(t)}`, { env: { ...ENV, BLOCK_PRIVATE: "1" } });
+      return `${r.status} ${await r.text()}`;
+    };
+    let why = await reasonFor("[2001:4860:4860:0:0:0:0:8888]:22");
+    check("a public IPv6 address in long form is refused with its standard form", why === "403 Target address is not in standard form; write it as [2001:4860:4860::8888]", why);
+    why = await reasonFor("8.8.8.08:22");
+    check("a public IPv4 address with a leading zero is refused as non-standard, not as private", /^403 Target address is not in standard form; write IPv4/.test(why), why);
+    why = await reasonFor("[::ffff:8.8.8.8]:22");
+    check("a dotted v4-mapped address is pointed to the plain IPv4 address", why === "403 Target address is not in standard form; write it as 8.8.8.8", why);
+    for (const t of ["[1:2:3:4:5:6:7:8:9]:22", "[::1.]:22"]) {
+      why = await reasonFor(t);
+      check(`malformed IPv6 is called that, not given IPv4 advice: ${t}`, why === "403 Target address is not a valid IPv6 address", why);
+    }
+    why = await reasonFor("10.0.0.5:22");
+    check("a private address still says it is private", why === "403 Private/loopback addresses not allowed", why);
+    for (const t of ["8.8.8.8:22", "example.com:22", "[2606:4700::1111]:22", "192.0.43.10:22", "cafe.be:22",
+                     "[2001:4860:4860::8888]:22", "[2001:470::1]:22", "[fe8::1]:22", "[fc::1]:22", "[ff::1]:22", "[::ffff:808:808]:22"]) {
+      // A target that passes the policy goes on to create a WebSocketPair,
+      // which Node lacks; reaching that point is the pass condition.
+      // Only reaching the WebSocketPair counts; a 400 or 403 is a failure.
+      let passed;
+      try {
+        res = await upgrade(`?token=${TOKEN}&target=${encodeURIComponent(t)}`, { env: { ...ENV, BLOCK_PRIVATE: "1" } });
+        passed = res.status === 101;
+      } catch (e) {
+        passed = /WebSocketPair/.test(String(e));
+      }
+      check(`BLOCK_PRIVATE lets a public target through: ${t}`, passed);
+    }
+
+    // Drive a successful upgrade with stand-ins for WebSocketPair and the 101
+    // Response, which Node cannot construct.
+    {
+      const pairServer = fakeWebSocket();
+      const RealResponse = globalThis.Response;
+      const realPair = globalThis.WebSocketPair;
+      globalThis.WebSocketPair = class { constructor() { this[0] = { side: "client" }; this[1] = pairServer; } };
+      globalThis.Response = class { constructor(b, init = {}) { this.status = init.status; this.webSocket = init.webSocket; } };
+      try {
+        res = await upgrade(`?token=${TOKEN}&target=127.0.0.1:${sshdPort}`);
+      } finally {
+        globalThis.Response = RealResponse;
+        if (realPair === undefined) delete globalThis.WebSocketPair; else globalThis.WebSocketPair = realPair;
+      }
+      check("a valid upgrade returns 101 with the client socket",
+        res.status === 101 && res.webSocket?.side === "client", `status=${res.status}`);
+      check("the server socket asks for ArrayBuffer frames (binaryType)",
+        pairServer.binaryType === "arraybuffer", `binaryType=${pairServer.binaryType}`);
+      pairServer.emit("close", {});
+    }
     sshd.close();
   } finally {
     server.close();

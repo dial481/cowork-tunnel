@@ -64,6 +64,23 @@ Entries in `ALLOWED_HOSTS` are treated as a deliberate decision and override `BL
 
 **The token travels in the query string** because some proxies strip `Authorization` headers. It is also sent as a header. Query strings land in access logs — the shipped nginx config sets `access_log off` for the tunnel location, and the Cloudflare Worker's request logs will contain it. Factor that into where you let logs go.
 
+**The client does not check the relay's certificate, and ignores `HTTPS_PROXY`.** That is what lets it work in Cowork, where the network rewrites TLS. It is a known gap, and a low-priority one:
+
+- What it exposes: someone who can pose as your relay (they would need to control DNS, the network or the proxy you are on) gets the relay token. They can also answer the tunnel with a server of their own. Whether that works depends on the host key check:
+  - If ssh already knows the server's host key (a `known_hosts` entry, or `StrictHostKeyChecking yes` with the key pinned), a fake server is refused before anything is sent. The impostor gets the token and nothing else.
+  - If it doesn't, for example a first connection with `StrictHostKeyChecking accept-new` or `no`, ssh accepts the impostor's host key. Everything you then send goes to the impostor: the commands you run, files you upload, and a password if you use one. What comes back can be faked.
+- What it never exposes: your SSH private key. Key login sends a signature tied to that one session, never the key, and the signature can't be replayed against your real server. The exception is agent forwarding (`ForwardAgent yes`), which lets the other end use your agent while you're connected, so leave it off.
+- What a stolen token costs: free use of your relay as a TCP and HTTP proxy, attributed to you, until you rotate it.
+
+**The real protection is the host key check, whichever client you use.** A relay that verifies TLS still connects to your server over the open internet, and anyone who can hijack that leg (DNS for the server's name, routing) can pose as the server in exactly the same way. Put each server's host key in `known_hosts` before the first connection, and use `StrictHostKeyChecking yes`. bootstrap.sh does not do this for you.
+
+- If you can read the key on the server (`cat /etc/ssh/ssh_host_ed25519_key.pub`), add that line, prefixed with the host name, to `~/.ssh/known_hosts`. For example `server.example.com ssh-ed25519 AAAA...`, or `[server.example.com]:2222 ssh-ed25519 AAAA...` for a non-standard port.
+- If you only have the fingerprint (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the server, or your provider's console shows it), collect the key with `ssh-keyscan -t ed25519 server.example.com > key.txt` and run `ssh-keygen -lf key.txt`. Add `key.txt` to `known_hosts` only if the two fingerprints match. Through the tunnel, `ssh-keyscan` needs the same ProxyCommand, so it is often easier to do this from a machine that can reach the server directly.
+
+Also worth doing: rotate the token if you suspect anything, and narrow the relay with `ALLOWED_HOSTS`. A client that verifies TLS and keeps the proxy may come later as an opt-in; it is deliberately not the default, because the default has to work in Cowork.
+
+**Large downloads to a slow client are buffered in the Worker.** A Workers WebSocket gives no way to tell how far behind the client is, so the Worker cannot slow the target down. For ssh, scp, sftp and rsync this does not matter: SSH's own flow control keeps the target from sending more than the client has room for. Measured in workerd, a 300 MB scp download throttled to 5 MB/s used no more Worker memory than an unthrottled one. Tunnelling a protocol with no flow control of its own to a slow client could run the Worker out of memory and drop the connection. Low priority; a fix needs the client to acknowledge what it has received.
+
 ## Quick Start
 
 ### Client (in the restricted environment)
@@ -518,7 +535,7 @@ Two constraints drove the whole design. Neither is exotic — most HTTPS-only en
 
 There is also often an explicit `HTTPS_PROXY` in the environment. The `websockets` library doesn't speak `CONNECT`, so `ws_proxy.py` clears those variables and connects directly.
 
-**What that costs you.** Since the client can't verify the relay's certificate, someone positioned between the two could read the bearer token in transit. Your SSH session is unaffected — it's encrypted end to end and host key verification still applies, so the tunnel operator and any observer see only ciphertext. The token is the exposed item, which is why it's worth rotating if you suspect it leaked.
+**What that costs you.** Since the client can't verify the relay's certificate, someone positioned between the two could read the bearer token in transit, and could answer with a fake SSH server. The SSH session is safe only if ssh already knows the server's host key: then a fake server is refused, and the relay operator and any observer see only ciphertext. On a first connection that accepts any key, the impostor receives what you send. See [Security Model](#security-model--read-this-first) for what is exposed in each case.
 
 ## Design notes: why the relay listens twice
 

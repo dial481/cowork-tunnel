@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cowork-tunnel"
-version = "2.1.0"
+version = "2.1.1"
 description = "SSH and HTTP proxy for environments whose only outbound path is HTTPS"
 readme = "README.md"
 requires-python = ">=3.10"
